@@ -1,0 +1,301 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  password      String
+  role          UserRole  @default(USER)
+  isActive      Boolean   @default(true)
+  
+  // Session management
+  sessions      Session[]
+  
+  // Password reset
+  resetTokens   ResetToken[]
+  
+  // Messages sent by this user
+  messages      Message[]
+  
+  // Metadata
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([email])
+  @@index([role])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([sessionToken])
+  @@index([userId])
+}
+
+model ResetToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expires   DateTime
+  used      Boolean  @default(false)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Metadata
+  createdAt DateTime @default(now())
+  
+  @@index([token])
+  @@index([userId])
+  @@index([expires])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  from      String   // Phone number who sent the message
+  to        String   // Phone number who received the message
+  text      String   // Message content
+  timestamp DateTime @default(now())
+  type      MessageType
+  status    MessageStatus @default(SENDING)
+  contactName String? // Contact name if available
+  clientId   String?  // External client that initiated this message (if any)
+  userId     String?  // Internal user who sent the message (for sent messages)
+  
+  // Relations
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  // WhatsApp specific fields
+  whatsappMessageId String? // WhatsApp's message ID
+  conversationId    String? // WhatsApp conversation ID
+  
+  // Template message metadata
+  templateParameters Json? // Actual parameter values used when sending template (for rendering)
+  
+  // Metadata
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([from])
+  @@index([to])
+  @@index([timestamp])
+  @@index([type])
+  @@index([status])
+  @@index([clientId])
+  @@index([userId])
+  @@index([whatsappMessageId])
+}
+
+model CustomerServiceWindow {
+  id        String   @id @default(cuid())
+  phoneNumber String @unique // Customer phone number
+  isOpen    Boolean  @default(false)
+  openedAt  DateTime @default(now())
+  expiresAt DateTime
+  lastUserMessageAt DateTime?
+  messageCount Int @default(0)
+  
+  // Metadata
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([phoneNumber])
+  @@index([expiresAt])
+  @@index([isOpen])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  phoneNumber String   @unique
+  name        String?
+  email       String?
+  company     String?
+  
+  // WhatsApp specific
+  whatsappId  String? // WhatsApp's wa_id
+  
+  // Metadata
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([phoneNumber])
+  @@index([name])
+}
+
+model Template {
+  id          String   @id @default(cuid())
+  name        String
+  language    String
+  category    String
+  status      TemplateStatus
+  components  Json? // Template components as JSON
+  
+  // WhatsApp specific
+  whatsappTemplateId String?
+  
+  // Permissions: empty arrays mean available to all (backward compatible)
+  allowedUserIds  String[] @default([]) // Users who can send/see this template
+  allowedClientIds String[] @default([]) // Integrations/clients who can send/see this template
+  
+  // Metadata
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([name, language])
+  @@index([name])
+  @@index([status])
+  @@index([category])
+}
+
+model BusinessNumber {
+  id          String   @id @default(cuid())
+  numberId    String   @unique // WhatsApp phone number ID
+  phoneNumber String   @unique // Actual phone number
+  wabaId      String   // WhatsApp Business Account ID
+  label       String   // Display name (e.g., "Test Number", "Live Number")
+  isActive    Boolean  @default(true)
+  
+  // Metadata
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([numberId])
+  @@index([isActive])
+}
+
+model WebhookLog {
+  id        String   @id @default(cuid())
+  eventType String   // "message", "status", "verification"
+  payload   Json     // Full webhook payload
+  processed Boolean  @default(false)
+  error     String?
+  
+  // Metadata
+  createdAt DateTime @default(now())
+
+  @@index([eventType])
+  @@index([processed])
+  @@index([createdAt])
+}
+
+/// External integrations (multi-tenant)
+model Client {
+  id               String   @id @default(cuid())
+  name             String   @unique
+  isActive         Boolean  @default(true)
+  defaultNumberId  String?
+  rateLimitPerMin  Int      @default(60)
+  ipAllowlist      Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Relations
+  apiKeys          ApiKey[]
+  webhooks         ClientWebhook[]
+  requestLogs      ExtRequestLog[]
+  idempotencyKeys  IdempotencyKey[]
+}
+
+model ApiKey {
+  id         String   @id @default(cuid())
+  clientId   String
+  keyHash    String   // store a hash, never plaintext
+  scopes     String[] @default([])
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime?
+
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([isActive])
+}
+
+model ClientWebhook {
+  id        String   @id @default(cuid())
+  clientId  String
+  url       String
+  secret    String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([isActive])
+}
+
+model ExtRequestLog {
+  id           String   @id @default(cuid())
+  clientId     String
+  method       String
+  path         String
+  numberId     String?
+  status       String
+  responseCode Int
+  durationMs   Int
+  ip           String?
+  userAgent    String?
+  requestedAt  DateTime @default(now())
+  respondedAt  DateTime @default(now())
+  requestHeadersSubset Json?
+  requestBody  Json?
+  responseBody Json?
+  error        String?
+
+  client       Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, requestedAt])
+  @@index([responseCode])
+}
+
+model IdempotencyKey {
+  id        String   @id @default(cuid())
+  clientId  String
+  key       String
+  messageId String?
+  createdAt DateTime @default(now())
+
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, key])
+}
+
+// Enums
+enum UserRole {
+  ADMIN
+  USER
+  MANAGER
+}
+
+enum MessageType {
+  SENT
+  RECEIVED
+}
+
+enum MessageStatus {
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum TemplateStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+}

@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: wabm_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wabm_db_dev
+      POSTGRES_USER: wabm_user
+      POSTGRES_PASSWORD: wabm_password
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - wabm_network_dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wabm_user -d wabm_db_dev"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+
+  # WABM Application (Development)
+  wabm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wabm_app_dev
+    restart: unless-stopped
+    env_file:
+      - .env.local
+    environment:
+      # Database - Use environment variables from .env.local
+      DATABASE_URL: ${DATABASE_URL:-postgresql://wabm_user:wabm_password@postgres:5432/wabm_db_dev}
+      
+      # AWS SES Email Configuration
+      # Values are primarily sourced from .env.local via env_file.
+      # We only set safe defaults here; sensitive credentials (SMTP_USER, SMTP_PASS)
+      # are read directly from .env.local inside the container.
+      AWS_SES_REGION: ${AWS_SES_REGION:-ap-southeast-1}
+      SMTP_HOST: ${SMTP_HOST:-email-smtp.ap-southeast-1.amazonaws.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      
+      # Node Environment
+      NODE_ENV: production
+      PORT: 3000
+      # Limit Node.js thread pool size to reduce CPU usage
+      UV_THREADPOOL_SIZE: 4
+      # Limit Next.js workers (if supported)
+      NEXT_PRIVATE_WORKER_COUNT: 2
+
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - wabm_network_dev
+    user: "1002:1002"  # Run as nextjs user (UID:GID from Dockerfile)
+    command: >
+      sh -c "
+        echo 'Waiting for database to be ready...' &&
+        npx prisma migrate deploy &&
+        echo 'Seeding database...' &&
+        npx prisma db seed &&
+        echo 'Starting WABM Development application...' &&
+        node server.js
+      "
+
+volumes:
+  postgres_data_dev:
+    driver: local
+
+networks:
+  wabm_network_dev:
+    driver: bridge 
