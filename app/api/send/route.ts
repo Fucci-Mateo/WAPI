@@ -1,21 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../lib/auth';
-import { MessageDatabaseService, CustomerServiceWindowDatabaseService, BusinessNumberDatabaseService } from '../../lib/database';
+import { MessageDatabaseService, CustomerServiceWindowDatabaseService, BusinessNumberDatabaseService, ContactDatabaseService, conversationSummaryDB } from '../../lib/database';
+import { getCanonicalContactIdentity, getContactIdentityAliases, normalizeWhatsAppIdentity } from '../../lib/whatsappIdentity';
 
 const messageService = new MessageDatabaseService();
 const customerServiceWindowService = new CustomerServiceWindowDatabaseService();
 const businessNumberService = new BusinessNumberDatabaseService();
-
-// Normalize phone number format (remove + prefix, spaces, and URL encoding for consistency)
-const normalizePhoneNumber = (phone: string): string => {
-  if (!phone) return '';
-  // Remove + prefix
-  let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-  // Remove all spaces and URL encoding
-  normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-  return normalized;
-};
+const contactService = new ContactDatabaseService();
 
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v19.0';
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -85,11 +77,22 @@ export async function POST(req: NextRequest) {
 
   try {
     const resolvedNumberId = await resolvePhoneNumberId(numberId);
-    
+    const businessNumber = await businessNumberService.getByNumberId(resolvedNumberId);
+    const businessScope = businessNumber?.wabaId || null;
+
+    const normalizedTo = normalizeWhatsAppIdentity(to);
+    const windowStatus = await customerServiceWindowService.getWindowStatus(businessScope || 'legacy', normalizedTo);
+    if (!windowStatus.canSendFreeForm) {
+      return NextResponse.json(
+        { error: 'Customer service window is closed. You can only send template messages.' },
+        { status: 403 }
+      );
+    }
+
     // Build request body based on whether it's a text or media message
     let requestBody: any = {
       messaging_product: 'whatsapp',
-      to,
+      to: normalizedTo,
     };
 
     if (mediaId) {
@@ -142,7 +145,6 @@ export async function POST(req: NextRequest) {
     // Store the sent message in the database
     if (data.messages && data.messages[0]) {
       const messageId = data.messages[0].id;
-      const normalizedTo = normalizePhoneNumber(to);
       
       // Get current user session to track who sent the message
       const session = await getServerSession(authOptions);
@@ -174,13 +176,40 @@ export async function POST(req: NextRequest) {
       const savedMessage = await messageService.addMessage(sentMessage);
       console.log(`📤 Sent message stored: ${numberId} -> ${normalizedTo}: ${messageText}${userId ? ` (by user ${userId})` : ''}`);
       console.log(`📤 WhatsApp message ID stored: ${messageId} for message type: ${mediaType || 'text'}`);
+
+      const recipientContact = await contactService.getContact(normalizedTo, businessScope);
+      const recipientAliases = recipientContact ? getContactIdentityAliases(recipientContact) : [normalizedTo];
+      const canonicalConversationKey = recipientContact ? getCanonicalContactIdentity(recipientContact) : normalizedTo;
+      const summary = await conversationSummaryDB.upsertFromMessage({
+        businessNumberId: resolvedNumberId,
+        message: {
+          from: sentMessage.from,
+          to: sentMessage.to,
+          text: sentMessage.text,
+          type: sentMessage.type,
+          status: sentMessage.status,
+          contactName: recipientContact?.name || null,
+          templateParameters: null,
+          timestamp: savedMessage.timestamp,
+        },
+        contact: recipientContact
+          ? {
+              id: recipientContact.id,
+              phoneNumber: recipientContact.phoneNumber,
+              businessScopedUserId: recipientContact.businessScopedUserId,
+              whatsappId: recipientContact.whatsappId,
+              name: recipientContact.name,
+            }
+          : null,
+        businessScope,
+      });
       
       // Broadcast new message to connected clients via SSE
       try {
         const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
         broadcastMessage(
           resolvedNumberId || null,
-          normalizedTo,
+          recipientAliases,
           {
             id: savedMessage.id,
             from: resolvedNumberId,
@@ -191,23 +220,19 @@ export async function POST(req: NextRequest) {
             status: 'sending',
             userId,
             whatsappMessageId: messageId,
+            conversationKey: canonicalConversationKey,
+            conversationAliases: recipientAliases,
           }
         );
         
         // Also broadcast active chats update
         if (resolvedNumberId) {
-          broadcastActiveChatsUpdate(resolvedNumberId);
+          broadcastActiveChatsUpdate(resolvedNumberId, summary || undefined);
         }
       } catch (error) {
         console.error('Error broadcasting message:', error);
       }
     }
-    
-    // Refresh the customer service window for the recipient
-    // This ensures the window stays open for subsequent messages
-    const normalizedTo = normalizePhoneNumber(to);
-    await customerServiceWindowService.openWindow(normalizedTo);
-    console.log(`🕐 Customer service window refreshed for ${normalizedTo}`);
     
     console.log('Message sent successfully to WhatsApp');
     return NextResponse.json({ status: 'sent', data });

@@ -1,4 +1,13 @@
 import { PrismaClient, Prisma } from '@prisma/client';
+import {
+  getCanonicalContactIdentity,
+  getContactIdentityAliases,
+  isLikelyBusinessScopedUserId,
+  isLikelyPhoneIdentity,
+  normalizeWhatsAppIdentity,
+  sameWhatsAppIdentity,
+} from './whatsappIdentity';
+import type { ActiveChat } from '../components/types';
 
 // Global prisma instance
 const globalForPrisma = globalThis as unknown as {
@@ -8,6 +17,355 @@ const globalForPrisma = globalThis as unknown as {
 export const prisma = globalForPrisma.prisma ?? new PrismaClient();
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
+
+async function resolveBusinessNumberScope(numberId: string) {
+  return prisma.businessNumber.findUnique({
+    where: { numberId },
+    select: {
+      id: true,
+      numberId: true,
+      phoneNumber: true,
+      wabaId: true,
+      label: true,
+      isActive: true,
+    },
+  });
+}
+
+async function resolveContactByIdentity(identity: string, wabaId?: string | null) {
+  const normalizedIdentity = normalizeWhatsAppIdentity(identity);
+  if (!normalizedIdentity) return null;
+
+  return prisma.contact.findFirst({
+    where: {
+      ...(wabaId ? { wabaId } : {}),
+      OR: [
+        { phoneNumber: normalizedIdentity },
+        { businessScopedUserId: normalizedIdentity },
+        { whatsappId: normalizedIdentity },
+      ],
+    },
+  });
+}
+
+type ConversationSummaryContact = {
+  id: string;
+  phoneNumber: string | null;
+  businessScopedUserId: string | null;
+  whatsappId: string | null;
+  name: string | null;
+};
+
+type ConversationSummaryMessage = {
+  from: string;
+  to: string;
+  text: string;
+  type: 'SENT' | 'RECEIVED';
+  status?: 'SENDING' | 'SENT' | 'DELIVERED' | 'READ' | 'FAILED';
+  contactName?: string | null;
+  templateParameters?: Record<string, any> | null;
+  timestamp: Date | string;
+};
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function toDate(value: Date | string): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function normalizeNullableIdentity(value: string | null | undefined): string | null {
+  const normalized = normalizeWhatsAppIdentity(value);
+  return normalized || null;
+}
+
+function getBusinessIdentityAliases(source: { numberId: string; phoneNumber: string | null | undefined }): string[] {
+  return Array.from(
+    new Set([
+      normalizeWhatsAppIdentity(source.numberId),
+      normalizeWhatsAppIdentity(source.phoneNumber),
+    ].filter(Boolean))
+  );
+}
+
+class ConversationSummaryDatabaseService {
+  private async countUnreadMessagesForConversation(
+    businessNumberId: string,
+    businessIdentity: string,
+    aliases: string[]
+  ): Promise<number> {
+    if (!businessIdentity || aliases.length === 0) {
+      return 0;
+    }
+
+    return prisma.message.count({
+      where: {
+        type: 'RECEIVED',
+        status: { not: 'READ' },
+        to: businessIdentity,
+        OR: aliases.map((alias) => ({ from: alias })),
+      },
+    });
+  }
+
+  private toActiveChat(summary: {
+    chatKey: string;
+    phoneNumber: string | null;
+    businessScopedUserId: string | null;
+    contactId: string | null;
+    contactName: string | null;
+    lastMessage: string | null;
+    lastMessageTimestamp: Date | string | null;
+    lastMessageType: 'SENT' | 'RECEIVED' | null;
+    unreadCount: number;
+    templateParameters: Prisma.JsonValue | null;
+  }): ActiveChat & { templateParameters?: Prisma.JsonValue | null } {
+    const templateParameters =
+      summary.templateParameters && typeof summary.templateParameters === 'object' && !Array.isArray(summary.templateParameters)
+        ? (summary.templateParameters as Record<string, any>)
+        : null;
+
+    return {
+      phoneNumber: summary.phoneNumber || summary.chatKey,
+      chatKey: summary.chatKey,
+      contactId: summary.contactId,
+      businessScopedUserId: summary.businessScopedUserId,
+      contactName: summary.contactName,
+      lastMessage: summary.lastMessage,
+      lastMessageTimestamp: summary.lastMessageTimestamp ? toDate(summary.lastMessageTimestamp).toISOString() : null,
+      lastMessageType: summary.lastMessageType ? (summary.lastMessageType.toLowerCase() as ActiveChat['lastMessageType']) : null,
+      unreadCount: summary.unreadCount,
+      templateParameters,
+    };
+  }
+
+  private resolveContactFields(
+    customerIdentity: string,
+    contact: ConversationSummaryContact | null
+  ) {
+    const normalizedCustomerIdentity = normalizeWhatsAppIdentity(customerIdentity);
+
+    const phoneNumber = contact?.phoneNumber || (isLikelyPhoneIdentity(normalizedCustomerIdentity) ? normalizedCustomerIdentity : null);
+    const businessScopedUserId =
+      contact?.businessScopedUserId ||
+      (isLikelyBusinessScopedUserId(normalizedCustomerIdentity) ? normalizedCustomerIdentity : null);
+
+    return {
+      phoneNumber,
+      businessScopedUserId,
+      contactId: contact?.id || null,
+      contactName: contact?.name || null,
+      normalizedCustomerIdentity,
+    };
+  }
+
+  async getActiveChats(businessNumberId: string): Promise<ActiveChat[]> {
+    const summaries = await prisma.conversationSummary.findMany({
+      where: { businessNumberId },
+      orderBy: { lastMessageTimestamp: 'desc' as Prisma.SortOrder },
+    });
+
+    if (summaries.length > 0) {
+      return summaries.map((summary) => this.toActiveChat(summary as any));
+    }
+
+    // Backward-compatible fallback: build the summaries once from the legacy scan path.
+    const legacyChats = await new MessageDatabaseService().getActiveContactsLegacy(businessNumberId);
+    if (legacyChats.length > 0) {
+      await this.replaceBusinessNumberSummaries(businessNumberId, legacyChats);
+    }
+
+    return legacyChats;
+  }
+
+  async getActiveContacts(businessNumberId: string): Promise<ActiveChat[]> {
+    return this.getActiveChats(businessNumberId);
+  }
+
+  async replaceBusinessNumberSummaries(businessNumberId: string, activeChats: ActiveChat[]) {
+    await prisma.conversationSummary.deleteMany({
+      where: { businessNumberId },
+    });
+
+    const now = new Date();
+    const rows = activeChats.map((chat) => ({
+      businessNumberId,
+      chatKey: normalizeWhatsAppIdentity(chat.chatKey || chat.phoneNumber),
+      phoneNumber: normalizeNullableIdentity(chat.phoneNumber) || normalizeNullableIdentity(chat.chatKey),
+      businessScopedUserId: normalizeNullableIdentity(chat.businessScopedUserId),
+      contactId: chat.contactId || null,
+      contactName: chat.contactName || null,
+      lastMessage: chat.lastMessage || null,
+      lastMessageTimestamp: chat.lastMessageTimestamp ? toDate(chat.lastMessageTimestamp) : null,
+      lastMessageType: chat.lastMessageType ? (chat.lastMessageType.toUpperCase() as 'SENT' | 'RECEIVED') : null,
+      unreadCount: chat.unreadCount || 0,
+      templateParameters:
+        (chat as ActiveChat & { templateParameters?: Prisma.JsonValue | null }).templateParameters == null
+          ? Prisma.DbNull
+          : ((chat as ActiveChat & { templateParameters?: Prisma.JsonValue | null }).templateParameters as Prisma.InputJsonValue | undefined),
+      createdAt: now,
+      updatedAt: now,
+    }));
+
+    for (const batch of chunkArray(rows, 500)) {
+      if (batch.length === 0) continue;
+      await prisma.conversationSummary.createMany({
+        data: batch,
+        skipDuplicates: true,
+      });
+    }
+  }
+
+  async upsertFromMessage(params: {
+    businessNumberId: string;
+    message: ConversationSummaryMessage;
+    contact?: ConversationSummaryContact | null;
+    businessScope?: string | null;
+  }): Promise<ActiveChat | null> {
+    const { businessNumberId, message, businessScope } = params;
+    const businessNumber = await resolveBusinessNumberScope(businessNumberId);
+    if (!businessNumber) return null;
+
+    const customerIdentity = message.type === 'SENT' ? message.to : message.from;
+    const contact = params.contact || (businessScope ? await resolveContactByIdentity(customerIdentity, businessScope) : await resolveContactByIdentity(customerIdentity));
+    const chatKey = contact ? getCanonicalContactIdentity(contact) : normalizeWhatsAppIdentity(customerIdentity);
+    if (!chatKey) return null;
+
+    const contactFields = this.resolveContactFields(customerIdentity, contact);
+    const businessIdentity = normalizeWhatsAppIdentity(businessNumber.phoneNumber);
+    const aliases = contact ? getContactIdentityAliases(contact).filter(Boolean) : [contactFields.normalizedCustomerIdentity].filter(Boolean);
+
+    const baseData = {
+      businessNumberId,
+      chatKey,
+      phoneNumber: contactFields.phoneNumber,
+      businessScopedUserId: contactFields.businessScopedUserId,
+      contactId: contactFields.contactId,
+      contactName: contactFields.contactName || message.contactName || null,
+      lastMessage: message.text || null,
+      lastMessageTimestamp: toDate(message.timestamp),
+      lastMessageType: message.type,
+      templateParameters: message.templateParameters,
+    };
+
+    const existing = await prisma.conversationSummary.findUnique({
+      where: {
+        businessNumberId_chatKey: {
+          businessNumberId,
+          chatKey,
+        },
+      },
+      select: {
+        unreadCount: true,
+      },
+    });
+
+    if (existing) {
+      const data: Prisma.ConversationSummaryUpdateInput = {
+        ...baseData,
+        contactId: baseData.contactId || undefined,
+        contactName: baseData.contactName || undefined,
+        businessScopedUserId: baseData.businessScopedUserId || undefined,
+        phoneNumber: baseData.phoneNumber || undefined,
+        templateParameters:
+          baseData.templateParameters == null
+            ? Prisma.DbNull
+            : (baseData.templateParameters as Prisma.InputJsonValue),
+      };
+
+      if (message.type === 'RECEIVED') {
+        data.unreadCount = {
+          increment: 1,
+        };
+      }
+
+      const updated = await prisma.conversationSummary.update({
+        where: {
+          businessNumberId_chatKey: {
+            businessNumberId,
+            chatKey,
+          },
+        },
+        data,
+      });
+
+      return this.toActiveChat(updated as any);
+    }
+
+    const unreadCount = await this.countUnreadMessagesForConversation(
+      businessNumberId,
+      businessIdentity,
+      aliases
+    );
+
+    const created = await prisma.conversationSummary.create({
+        data: {
+          ...baseData,
+          unreadCount,
+          templateParameters:
+          baseData.templateParameters == null
+            ? Prisma.DbNull
+            : (baseData.templateParameters as Prisma.InputJsonValue),
+      },
+    });
+
+    return this.toActiveChat(created as any);
+  }
+
+  async recalculateUnreadCount(params: {
+    businessNumberId: string;
+    customerIdentity: string;
+    contact?: ConversationSummaryContact | null;
+    businessScope?: string | null;
+  }): Promise<ActiveChat | null> {
+    const { businessNumberId, customerIdentity, businessScope } = params;
+    const businessNumber = await resolveBusinessNumberScope(businessNumberId);
+    if (!businessNumber) return null;
+
+    const contact = params.contact || (businessScope ? await resolveContactByIdentity(customerIdentity, businessScope) : await resolveContactByIdentity(customerIdentity));
+    const chatKey = contact ? getCanonicalContactIdentity(contact) : normalizeWhatsAppIdentity(customerIdentity);
+    if (!chatKey) return null;
+
+    const contactFields = this.resolveContactFields(customerIdentity, contact);
+    const businessIdentity = normalizeWhatsAppIdentity(businessNumber.phoneNumber);
+    const aliases = contact ? getContactIdentityAliases(contact).filter(Boolean) : [contactFields.normalizedCustomerIdentity].filter(Boolean);
+    const unreadCount = await this.countUnreadMessagesForConversation(businessNumberId, businessIdentity, aliases);
+
+    const updated = await prisma.conversationSummary.upsert({
+      where: {
+        businessNumberId_chatKey: {
+          businessNumberId,
+          chatKey,
+        },
+      },
+      create: {
+        businessNumberId,
+        chatKey,
+        phoneNumber: contactFields.phoneNumber,
+        businessScopedUserId: contactFields.businessScopedUserId,
+        contactId: contactFields.contactId,
+        contactName: contactFields.contactName,
+        unreadCount,
+      },
+      update: {
+        phoneNumber: contactFields.phoneNumber || undefined,
+        businessScopedUserId: contactFields.businessScopedUserId || undefined,
+        contactId: contactFields.contactId || undefined,
+        contactName: contactFields.contactName || undefined,
+        unreadCount,
+      },
+    });
+
+    return this.toActiveChat(updated as any);
+  }
+}
+
+export const conversationSummaryDB = new ConversationSummaryDatabaseService();
 
 // Database service for messages
 export class MessageDatabaseService {
@@ -90,14 +448,18 @@ export class MessageDatabaseService {
     }
   }
 
-  async getMessagesByPhoneNumber(phoneNumber: string, limit = 50, offset = 0) {
+  async getMessagesByPhoneNumber(phoneNumber: string, limit = 50, offset = 0, wabaId?: string | null) {
     try {
+      const contact = wabaId ? await resolveContactByIdentity(phoneNumber, wabaId) : await resolveContactByIdentity(phoneNumber);
+      const aliases = contact ? getContactIdentityAliases(contact) : [normalizeWhatsAppIdentity(phoneNumber)];
+      const uniqueAliases = Array.from(new Set(aliases.filter(Boolean)));
+
       return await prisma.message.findMany({
         where: {
-          OR: [
-            { from: phoneNumber },
-            { to: phoneNumber },
-          ],
+          OR: uniqueAliases.flatMap((alias) => ([
+            { from: alias },
+            { to: alias },
+          ])),
         },
         orderBy: { timestamp: 'desc' as Prisma.SortOrder },
         take: limit,
@@ -109,44 +471,77 @@ export class MessageDatabaseService {
     }
   }
 
-  async getMessagesByBusinessNumber(businessNumberId: string, limit = 100, offset = 0) {
+  async getMessagesForConversation(businessNumberId: string, customerIdentity: string, limit = 50, offset = 0) {
     try {
-      // Get business number from database to get the phone number
-      const businessNumber = await prisma.businessNumber.findUnique({
-        where: { numberId: businessNumberId },
-      });
+      const businessNumber = await resolveBusinessNumberScope(businessNumberId);
 
       if (!businessNumber) {
         console.warn(`⚠️ Business number not found: ${businessNumberId}`);
         return [];
       }
 
-      const normalizedPhone = (phone: string) => {
-        if (!phone) return '';
-        let p = phone.startsWith('+') ? phone.substring(1) : phone;
-        // Remove all spaces, parentheses, hyphens, and URL encoding
-        return p.replace(/\s+/g, '').replace(/%20/g, '').replace(/[()-\s]/g, '');
-      };
+      const normalizedCustomerIdentity = normalizeWhatsAppIdentity(customerIdentity);
+      if (!normalizedCustomerIdentity) {
+        return [];
+      }
 
-      // Normalize the phone number from database
-      const toPhone = businessNumber.phoneNumber ? normalizedPhone(businessNumber.phoneNumber) : undefined;
+      const contact = businessNumber.wabaId
+        ? await resolveContactByIdentity(normalizedCustomerIdentity, businessNumber.wabaId)
+        : await resolveContactByIdentity(normalizedCustomerIdentity);
+      const customerAliases = (contact ? getContactIdentityAliases(contact) : [normalizedCustomerIdentity]).filter(Boolean);
+      const businessAliases = getBusinessIdentityAliases({
+        numberId: businessNumber.numberId,
+        phoneNumber: businessNumber.phoneNumber,
+      });
+
+      if (customerAliases.length === 0 || businessAliases.length === 0) {
+        return [];
+      }
+
+      return await prisma.message.findMany({
+        where: {
+          OR: customerAliases.flatMap((customerAlias) =>
+            businessAliases.flatMap((businessAlias) => ([
+              { from: businessAlias, to: customerAlias },
+              { from: customerAlias, to: businessAlias },
+            ]))
+          ),
+        },
+        orderBy: { timestamp: 'desc' as Prisma.SortOrder },
+        take: limit,
+        skip: offset,
+      });
+    } catch (error) {
+      console.error('❌ Error fetching conversation messages by business number:', error);
+      throw error;
+    }
+  }
+
+  async getMessagesByBusinessNumber(businessNumberId: string, limit = 100, offset = 0) {
+    try {
+      const businessNumber = await resolveBusinessNumberScope(businessNumberId);
+
+      if (!businessNumber) {
+        console.warn(`⚠️ Business number not found: ${businessNumberId}`);
+        return [];
+      }
+
+      const businessAliases = getBusinessIdentityAliases({
+        numberId: businessNumber.numberId,
+        phoneNumber: businessNumber.phoneNumber,
+      });
 
       console.log('🔍 getMessagesByBusinessNumber query params:', {
         businessNumberId,
         businessPhoneNumber: businessNumber.phoneNumber,
-        toPhone,
+        businessAliases,
         limit,
         offset
       });
 
       const query = {
         where: {
-          OR: [
-            // Outbound messages sent from this business number (stored as numberId)
-            { from: businessNumberId },
-            // Inbound messages to this business' display phone number
-            ...(toPhone ? [{ to: toPhone }] : []),
-          ],
+          OR: businessAliases.flatMap((businessAlias) => ([{ from: businessAlias }, { to: businessAlias }])),
         },
         orderBy: { timestamp: 'desc' as Prisma.SortOrder },
         take: limit,
@@ -175,14 +570,10 @@ export class MessageDatabaseService {
     }
   }
 
-  async getContactName(phoneNumber: string) {
+  async getContactName(phoneNumber: string, wabaId?: string | null) {
     try {
-      const message = await prisma.message.findFirst({
-        where: { from: phoneNumber },
-        select: { contactName: true },
-      });
-      
-      return message?.contactName || null;
+      const contact = await resolveContactByIdentity(phoneNumber, wabaId);
+      return contact?.name || null;
     } catch (error) {
       console.error('❌ Error fetching contact name:', error);
       return null;
@@ -201,36 +592,56 @@ export class MessageDatabaseService {
   }
 
   async getActiveContacts(businessNumberId: string) {
+    return conversationSummaryDB.getActiveContacts(businessNumberId);
+  }
+
+  async getActiveContactsLegacy(businessNumberId: string) {
     try {
-      // Get business number from database to get the phone number
-      const businessNumber = await prisma.businessNumber.findUnique({
-        where: { numberId: businessNumberId },
-      });
+      const businessNumber = await resolveBusinessNumberScope(businessNumberId);
 
       if (!businessNumber) {
         console.warn(`⚠️ Business number not found: ${businessNumberId}`);
         return [];
       }
 
-      const normalizedPhone = (phone: string) => {
-        if (!phone) return '';
-        let p = phone.startsWith('+') ? phone.substring(1) : phone;
-        // Remove all spaces, parentheses, hyphens, and URL encoding
-        return p.replace(/\s+/g, '').replace(/%20/g, '').replace(/[()-\s]/g, '');
-      };
+      const toIdentity = normalizeWhatsAppIdentity(businessNumber.phoneNumber);
+      const businessAliases = getBusinessIdentityAliases({
+        numberId: businessNumber.numberId,
+        phoneNumber: businessNumber.phoneNumber,
+      });
+      const businessScope = businessNumber.wabaId;
 
-      // Normalize the phone number from database
-      const toPhone = businessNumber.phoneNumber ? normalizedPhone(businessNumber.phoneNumber) : undefined;
+      const scopeContacts = businessScope
+        ? await prisma.contact.findMany({
+            where: { wabaId: businessScope },
+            select: {
+              id: true,
+              phoneNumber: true,
+              businessScopedUserId: true,
+              whatsappId: true,
+              name: true,
+            },
+          })
+        : [];
+
+      const identityToContact = new Map<string, {
+        id: string;
+        phoneNumber: string | null;
+        businessScopedUserId: string | null;
+        whatsappId: string | null;
+        name: string | null;
+      }>();
+
+      for (const contact of scopeContacts) {
+        for (const alias of getContactIdentityAliases(contact)) {
+          identityToContact.set(alias, contact);
+        }
+      }
 
       // Get all messages for this business number
       const allMessages = await prisma.message.findMany({
         where: {
-          OR: [
-            // Outbound messages sent from this business number (stored as numberId)
-            { from: businessNumberId },
-            // Inbound messages to this business' display phone number
-            ...(toPhone ? [{ to: toPhone }] : []),
-          ],
+          OR: businessAliases.flatMap((businessAlias) => ([{ from: businessAlias }, { to: businessAlias }])),
         },
         orderBy: { timestamp: 'desc' as Prisma.SortOrder },
         select: {
@@ -247,60 +658,52 @@ export class MessageDatabaseService {
 
       // Group messages by contact phone number and get latest message for each
       const contactMap = new Map<string, {
+        chatKey: string;
         phoneNumber: string;
+        businessScopedUserId: string | null;
+        contactId: string | null;
         lastMessage: string | null;
         lastMessageTimestamp: string | null;
         lastMessageType: 'sent' | 'received' | null;
         unreadCount: number;
         templateParameters: any;
+        contactName: string | null;
       }>();
 
-      // Helper to normalize phone numbers
-      const normalize = (phone: string) => {
-        if (!phone) return '';
-        let p = phone.startsWith('+') ? phone.substring(1) : phone;
-        return p.replace(/\s+/g, '').replace(/%20/g, '').replace(/[()-\s]/g, '');
-      };
-
-      const normalizedBusinessId = normalize(businessNumberId);
-      const normalizedToPhone = toPhone ? normalize(toPhone) : null;
-
       for (const msg of allMessages) {
-        // Determine the contact phone number (the one that's NOT the business number)
-        let contactPhone: string | null = null;
-        
-        const normalizedFrom = normalize(msg.from);
-        const normalizedTo = normalize(msg.to);
+        const normalizedFrom = normalizeWhatsAppIdentity(msg.from);
+        const normalizedTo = normalizeWhatsAppIdentity(msg.to);
 
-        if (normalizedFrom === normalizedBusinessId || normalizedFrom === normalizedToPhone) {
-          // Message sent from business, so contact is the 'to'
-          contactPhone = msg.to;
-        } else if (normalizedTo === normalizedBusinessId || normalizedTo === normalizedToPhone) {
-          // Message received by business, so contact is the 'from'
-          contactPhone = msg.from;
+        let contactIdentity: string | null = null;
+        if (normalizedFrom === businessNumberId || sameWhatsAppIdentity(normalizedFrom, toIdentity)) {
+          contactIdentity = normalizedTo;
+        } else if (normalizedTo === businessNumberId || sameWhatsAppIdentity(normalizedTo, toIdentity)) {
+          contactIdentity = normalizedFrom;
         }
 
-        if (!contactPhone) continue;
+        if (!contactIdentity) continue;
 
-        const normalizedContactPhone = normalize(contactPhone);
-        
-        // Skip if this is the business number itself
-        if (normalizedContactPhone === normalizedBusinessId || normalizedContactPhone === normalizedToPhone) {
-          continue;
-        }
+        const contactRecord = identityToContact.get(contactIdentity) || await resolveContactByIdentity(contactIdentity, businessScope);
+        const chatKey = contactRecord ? getCanonicalContactIdentity(contactRecord) : normalizeWhatsAppIdentity(contactIdentity);
 
-        if (!contactMap.has(normalizedContactPhone)) {
-          contactMap.set(normalizedContactPhone, {
-            phoneNumber: contactPhone, // Keep original format
+        if (!chatKey) continue;
+
+        if (!contactMap.has(chatKey)) {
+          contactMap.set(chatKey, {
+            chatKey,
+            phoneNumber: contactRecord?.phoneNumber || contactIdentity,
+            businessScopedUserId: contactRecord?.businessScopedUserId || null,
+            contactId: contactRecord?.id || null,
             lastMessage: null,
             lastMessageTimestamp: null,
             lastMessageType: null,
             unreadCount: 0,
             templateParameters: null,
+            contactName: contactRecord?.name || null,
           });
         }
 
-        const contact = contactMap.get(normalizedContactPhone)!;
+        const contact = contactMap.get(chatKey)!;
         
         // Update with latest message if this is the first one we've seen for this contact
         if (!contact.lastMessageTimestamp) {
@@ -333,13 +736,20 @@ export class MessageDatabaseService {
 
 // Database service for customer service windows
 export class CustomerServiceWindowDatabaseService {
-  async openWindow(phoneNumber: string) {
+  async openWindow(wabaId: string, phoneNumber: string) {
     try {
+      const scopeId = wabaId || 'legacy';
+      const contactKey = normalizeWhatsAppIdentity(phoneNumber);
       const now = new Date();
       const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours
 
       const result = await prisma.customerServiceWindow.upsert({
-        where: { phoneNumber },
+        where: {
+          wabaId_phoneNumber: {
+            wabaId: scopeId,
+            phoneNumber: contactKey,
+          },
+        },
         update: {
           isOpen: true,
           openedAt: now,
@@ -350,7 +760,8 @@ export class CustomerServiceWindowDatabaseService {
           },
         },
         create: {
-          phoneNumber,
+          wabaId: scopeId,
+          phoneNumber: contactKey,
           isOpen: true,
           openedAt: now,
           expiresAt,
@@ -358,8 +769,8 @@ export class CustomerServiceWindowDatabaseService {
           messageCount: 1,
         },
       });
-
-      console.log(`🕐 Customer service window opened/refreshed for ${phoneNumber}`);
+      
+      console.log(`🕐 Customer service window opened/refreshed for ${contactKey} (${scopeId})`);
       return result;
     } catch (error) {
       console.error('❌ Error opening customer service window:', error);
@@ -367,10 +778,17 @@ export class CustomerServiceWindowDatabaseService {
     }
   }
 
-  async getWindowStatus(phoneNumber: string) {
+  async getWindowStatus(wabaId: string, phoneNumber: string) {
     try {
+      const scopeId = wabaId || 'legacy';
+      const contactKey = normalizeWhatsAppIdentity(phoneNumber);
       const window = await prisma.customerServiceWindow.findUnique({
-        where: { phoneNumber },
+        where: {
+          wabaId_phoneNumber: {
+            wabaId: scopeId,
+            phoneNumber: contactKey,
+          },
+        },
       });
 
       const now = new Date();
@@ -452,22 +870,136 @@ export class CustomerServiceWindowDatabaseService {
 
 // Database service for contacts
 export class ContactDatabaseService {
-  async upsertContact(phoneNumber: string, name?: string, email?: string, company?: string, whatsappId?: string) {
+  async upsertContact(data: {
+    wabaId: string;
+    phoneNumber?: string | null;
+    businessScopedUserId?: string | null;
+    name?: string | null;
+    email?: string | null;
+    company?: string | null;
+    whatsappId?: string | null;
+  }) {
     try {
-      return await prisma.contact.upsert({
-        where: { phoneNumber },
-        update: {
-          name: name || undefined,
-          email: email || undefined,
-          company: company || undefined,
-          whatsappId: whatsappId || undefined,
-        },
-        create: {
-          phoneNumber,
-          name,
-          email,
-          company,
-          whatsappId,
+      const wabaId = data.wabaId || 'legacy';
+      const phoneNumber = normalizeWhatsAppIdentity(data.phoneNumber);
+      const businessScopedUserId = normalizeWhatsAppIdentity(data.businessScopedUserId);
+      const whatsappId = normalizeWhatsAppIdentity(data.whatsappId);
+      const name = data.name?.trim() || null;
+      const email = data.email?.trim() || null;
+      const company = data.company?.trim() || null;
+      const pick = (...values: Array<string | null | undefined>) => values.find((value) => value && value.trim()) || null;
+
+      const byPhone = phoneNumber
+        ? await prisma.contact.findUnique({
+            where: {
+              wabaId_phoneNumber: {
+                wabaId,
+                phoneNumber,
+              },
+            },
+          })
+        : null;
+
+      const byBsuid = businessScopedUserId
+        ? await prisma.contact.findUnique({
+            where: {
+              wabaId_businessScopedUserId: {
+                wabaId,
+                businessScopedUserId,
+              },
+            },
+          })
+        : null;
+
+      const byLegacy = !byPhone && !byBsuid && whatsappId
+        ? await prisma.contact.findFirst({
+            where: {
+              wabaId,
+              whatsappId,
+            },
+          })
+        : null;
+
+      const existing = byPhone || byBsuid || byLegacy;
+
+      if (!existing) {
+        return await prisma.contact.create({
+          data: {
+            wabaId,
+            phoneNumber: phoneNumber || null,
+            businessScopedUserId: businessScopedUserId || null,
+            name: name || undefined,
+            email: email || undefined,
+            company: company || undefined,
+            whatsappId: whatsappId || undefined,
+          },
+        });
+      }
+
+      const finalPhoneNumber = pick(
+        phoneNumber,
+        byPhone?.phoneNumber,
+        byBsuid?.phoneNumber,
+        byLegacy?.phoneNumber,
+        existing.phoneNumber,
+      );
+      const finalBusinessScopedUserId = pick(
+        businessScopedUserId,
+        byPhone?.businessScopedUserId,
+        byBsuid?.businessScopedUserId,
+        byLegacy?.businessScopedUserId,
+        existing.businessScopedUserId,
+      );
+      const finalWhatsappId = pick(
+        whatsappId,
+        byPhone?.whatsappId,
+        byBsuid?.whatsappId,
+        byLegacy?.whatsappId,
+        existing.whatsappId,
+      );
+      const finalName = pick(name, byPhone?.name, byBsuid?.name, byLegacy?.name, existing.name);
+      const finalEmail = pick(email, byPhone?.email, byBsuid?.email, byLegacy?.email, existing.email);
+      const finalCompany = pick(company, byPhone?.company, byBsuid?.company, byLegacy?.company, existing.company);
+
+      // If the phone and BSUID currently live on separate rows, merge them into a single record.
+      if (byPhone && byBsuid && byPhone.id !== byBsuid.id) {
+        const base = byPhone;
+        const duplicate = byBsuid;
+        const preferred = base.businessScopedUserId ? base : duplicate;
+        const secondary = preferred.id === base.id ? duplicate : base;
+
+        const mergedRecord = await prisma.$transaction(async (tx) => {
+          await tx.contact.delete({
+            where: { id: secondary.id },
+          });
+
+          return tx.contact.update({
+            where: { id: preferred.id },
+            data: {
+              wabaId,
+              phoneNumber: preferred.phoneNumber || finalPhoneNumber || undefined,
+              businessScopedUserId: preferred.businessScopedUserId || finalBusinessScopedUserId || undefined,
+              name: finalName || undefined,
+              email: finalEmail || undefined,
+              company: finalCompany || undefined,
+              whatsappId: finalWhatsappId || undefined,
+            },
+          });
+        });
+
+        return mergedRecord;
+      }
+
+      return await prisma.contact.update({
+        where: { id: existing.id },
+        data: {
+          wabaId,
+          phoneNumber: finalPhoneNumber || undefined,
+          businessScopedUserId: finalBusinessScopedUserId || undefined,
+          name: finalName || undefined,
+          email: finalEmail || undefined,
+          company: finalCompany || undefined,
+          whatsappId: finalWhatsappId || undefined,
         },
       });
     } catch (error) {
@@ -476,24 +1008,25 @@ export class ContactDatabaseService {
     }
   }
 
-  async getContact(phoneNumber: string) {
+  async getContact(phoneNumber: string, wabaId?: string | null) {
     try {
-      return await prisma.contact.findUnique({
-        where: { phoneNumber },
-      });
+      return await resolveContactByIdentity(phoneNumber, wabaId);
     } catch (error) {
       console.error('❌ Error fetching contact:', error);
       return null;
     }
   }
 
-  async searchContacts(query: string) {
+  async searchContacts(query: string, wabaId?: string | null) {
     try {
       return await prisma.contact.findMany({
         where: {
+          ...(wabaId ? { wabaId } : {}),
           OR: [
             { name: { contains: query, mode: 'insensitive' } },
             { phoneNumber: { contains: query } },
+            { businessScopedUserId: { contains: query, mode: 'insensitive' } },
+            { whatsappId: { contains: query, mode: 'insensitive' } },
             { email: { contains: query, mode: 'insensitive' } },
           ],
         },

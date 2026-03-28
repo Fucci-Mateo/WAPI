@@ -52,6 +52,9 @@ import {
   CheckboxGroup,
   Stack,
   Divider,
+  Alert,
+  AlertIcon,
+  AlertDescription,
 } from '@chakra-ui/react';
 import { EditIcon, DeleteIcon, AddIcon, CopyIcon, ViewIcon } from '@chakra-ui/icons';
 import { SCOPES } from '@/app/lib/extAuth';
@@ -500,6 +503,15 @@ export default function IntegrationsPage() {
             Add Client
           </Button>
         </HStack>
+
+        <Alert status="info" mb={6} borderRadius="md">
+          <AlertIcon />
+          <AlertDescription>
+            WhatsApp username support depends on Meta's contact book being enabled for the WABA.
+            If it is off, phone-number conversations continue to work, but BSUID-only contacts
+            may not resolve correctly.
+          </AlertDescription>
+        </Alert>
 
         <TableContainer bg={bgColor} borderRadius="md" border="1px" borderColor={borderColor}>
           <Table variant="simple">

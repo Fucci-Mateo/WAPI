@@ -1,21 +1,131 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { CustomerServiceWindowDatabaseService, MessageDatabaseService, ContactDatabaseService, BusinessNumberDatabaseService } from '../../lib/database';
+import { CustomerServiceWindowDatabaseService, MessageDatabaseService, ContactDatabaseService, BusinessNumberDatabaseService, conversationSummaryDB } from '../../lib/database';
 import { WebhookManager } from '../../lib/webhookConfig';
+import {
+  getCanonicalContactIdentity,
+  getContactIdentityAliases,
+  isLikelyBusinessScopedUserId,
+  isLikelyPhoneIdentity,
+  normalizeWhatsAppIdentity,
+  sameWhatsAppIdentity,
+} from '../../lib/whatsappIdentity';
 
 const customerServiceWindowService = new CustomerServiceWindowDatabaseService();
 const messageService = new MessageDatabaseService();
 const contactService = new ContactDatabaseService();
 const businessNumberService = new BusinessNumberDatabaseService();
 
-// Normalize phone number format (remove + prefix, spaces, and URL encoding for consistency)
-const normalizePhoneNumber = (phone: string): string => {
-  if (!phone) return '';
-  // Remove + prefix
-  let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-  // Remove all spaces and URL encoding
-  normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-  return normalized;
-};
+function getContactEntry(message: any, contacts: any[]) {
+  return contacts.find((c: any) =>
+    sameWhatsAppIdentity(c?.wa_id, message.from) ||
+    sameWhatsAppIdentity(c?.wa_id, message.to)
+  );
+}
+
+function extractIdentityPair(messageFrom: string, contactWaId?: string | null) {
+  const candidates = [
+    normalizeWhatsAppIdentity(messageFrom),
+    normalizeWhatsAppIdentity(contactWaId),
+  ].filter(Boolean);
+
+  const phoneNumber = candidates.find((value) => isLikelyPhoneIdentity(value)) || null;
+  const businessScopedUserId = candidates.find((value) => isLikelyBusinessScopedUserId(value)) || null;
+
+  return {
+    customerIdentity: normalizeWhatsAppIdentity(messageFrom),
+    phoneNumber,
+    businessScopedUserId,
+    contactWaId: normalizeWhatsAppIdentity(contactWaId),
+  };
+}
+
+async function storeIncomingMessage({
+  message,
+  contacts,
+  metadata,
+  businessScope,
+  customerText,
+}: {
+  message: any;
+  contacts: any[];
+  metadata: any;
+  businessScope: string | null;
+  customerText: string;
+}) {
+  const contactEntry = getContactEntry(message, contacts);
+  const identityPair = extractIdentityPair(message.from, contactEntry?.wa_id);
+  const scopeId = businessScope || 'legacy';
+
+  const contactRecord = await contactService.upsertContact({
+    wabaId: scopeId,
+    phoneNumber: identityPair.phoneNumber,
+    businessScopedUserId: identityPair.businessScopedUserId,
+    name: contactEntry?.profile?.name || undefined,
+    whatsappId: identityPair.contactWaId || undefined,
+  });
+
+  const canonicalContactKey = getCanonicalContactIdentity(contactRecord);
+  const contactAliases = getContactIdentityAliases(contactRecord);
+  const targetKey = canonicalContactKey || identityPair.customerIdentity;
+
+  await customerServiceWindowService.openWindow(scopeId, targetKey);
+
+  const storedMessage = {
+    from: identityPair.customerIdentity,
+    to: normalizeWhatsAppIdentity(metadata?.display_phone_number || 'Unknown'),
+    text: customerText,
+    type: 'RECEIVED' as const,
+    status: 'DELIVERED' as const,
+    contactName: contactRecord?.name || contactEntry?.profile?.name || targetKey,
+    whatsappMessageId: message.id,
+    conversationId: message.context?.id,
+  };
+
+  const savedMessage = await messageService.addMessage(storedMessage);
+  const summary = await conversationSummaryDB.upsertFromMessage({
+    businessNumberId: metadata?.phone_number_id,
+    message: {
+      from: storedMessage.from,
+      to: storedMessage.to,
+      text: storedMessage.text,
+      type: storedMessage.type,
+      status: storedMessage.status,
+      contactName: storedMessage.contactName,
+      timestamp: savedMessage.timestamp,
+    },
+    contact: contactRecord,
+    businessScope,
+  });
+
+  try {
+    const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
+    broadcastMessage(
+      metadata?.phone_number_id || null,
+      contactAliases.length > 0 ? contactAliases : [targetKey],
+      {
+        id: savedMessage.id,
+        from: identityPair.customerIdentity,
+        to: storedMessage.to,
+        text: storedMessage.text,
+        timestamp: savedMessage.timestamp.toISOString(),
+        type: 'received',
+        status: 'delivered',
+        contactName: storedMessage.contactName,
+        whatsappMessageId: storedMessage.whatsappMessageId,
+        conversationKey: targetKey,
+        conversationAliases: contactAliases,
+      }
+    );
+
+    if (metadata?.phone_number_id) {
+      broadcastActiveChatsUpdate(metadata.phone_number_id, summary || undefined);
+    }
+  } catch (error) {
+    console.error('Error broadcasting incoming message:', error);
+  }
+
+  return { savedMessage, contactRecord, targetKey };
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -40,14 +150,14 @@ export async function POST(request: NextRequest) {
         
         // Get active business numbers to verify this one is active
         const activeNumbers = await businessNumberService.getActive();
-        const isActiveNumber = activeNumbers.some(num => 
-          num.numberId === metadata?.phone_number_id
-        );
+        const activeBusinessNumber = activeNumbers.find((num) => num.numberId === metadata?.phone_number_id);
+        const isActiveNumber = !!activeBusinessNumber;
         
         if (!isActiveNumber) {
           console.log(`⚠️ Business number ${businessPhoneNumber} is not active, skipping webhook processing`);
           return NextResponse.json({ status: 'ok', message: 'Business number not active' });
         }
+        const businessScope = activeBusinessNumber?.wabaId || null;
         
         console.log(`📨 Processing ${messages.length} incoming message(s) for active business number ${businessPhoneNumber}`);
         
@@ -61,64 +171,14 @@ export async function POST(request: NextRequest) {
           });
 
           if (message.type === 'text' && message.from) {
-            // Normalize phone number for consistent storage
-            const normalizedPhoneNumber = normalizePhoneNumber(message.from);
-            
-            // Record user message to open/refresh customer service window
-            await customerServiceWindowService.openWindow(normalizedPhoneNumber);
-            
-            console.log(`🕐 Customer service window opened/refreshed for ${normalizedPhoneNumber}`);
-            
-            // Store the incoming message
-            const contact = contacts.find((c: any) => c.wa_id === message.from);
-            const contactName = contact?.profile?.name || normalizedPhoneNumber;
-            
-            // Store contact information with normalized phone number
-            if (contact?.profile?.name) {
-              await contactService.upsertContact(normalizedPhoneNumber, contact.profile.name);
-            }
-            
-            const storedMessage = {
-              from: normalizedPhoneNumber,
-              to: normalizePhoneNumber(metadata?.display_phone_number || 'Unknown'),
-              text: message.text?.body || '',
-              type: 'RECEIVED' as const,
-              status: 'DELIVERED' as const,
-              contactName,
-              whatsappMessageId: message.id,
-              conversationId: message.context?.id
-            };
-            
-            const savedMessage = await messageService.addMessage(storedMessage);
-            console.log(`💾 Incoming message stored: ${contactName} (${normalizedPhoneNumber})`);
-            
-            // Broadcast new message to connected clients via SSE
-            try {
-              const { broadcastMessage } = await import('../realtime/broadcast');
-              broadcastMessage(
-                metadata?.phone_number_id || null,
-                normalizedPhoneNumber,
-                {
-                  id: savedMessage.id,
-                  from: normalizedPhoneNumber,
-                  to: storedMessage.to,
-                  text: storedMessage.text,
-                  timestamp: savedMessage.timestamp.toISOString(),
-                  type: 'received',
-                  status: 'delivered',
-                  contactName,
-                  whatsappMessageId: storedMessage.whatsappMessageId,
-                }
-              );
-              
-              // Also broadcast active chats update
-              if (metadata?.phone_number_id) {
-                const { broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
-                broadcastActiveChatsUpdate(metadata.phone_number_id);
-              }
-            } catch (error) {
-              console.error('Error broadcasting message:', error);
-            }
+            const result = await storeIncomingMessage({
+              message,
+              contacts,
+              metadata,
+              businessScope,
+              customerText: message.text?.body || '',
+            });
+            console.log(`💾 Incoming message stored: ${result.contactRecord?.name || result.targetKey} (${result.targetKey})`);
             
           } else if (message.type === 'template' && message.from) {
             // Handle template messages
@@ -126,119 +186,30 @@ export async function POST(request: NextRequest) {
           } else if (message.type === 'image' && message.from) {
             // Handle image messages
             console.log(`🖼️ Image message received from ${message.from}`);
-            const normalizedPhoneNumber = normalizePhoneNumber(message.from);
-            await customerServiceWindowService.openWindow(normalizedPhoneNumber);
-
-            const contact = contacts.find((c: any) => c.wa_id === message.from);
-            const contactName = contact?.profile?.name || normalizedPhoneNumber;
-            if (contact?.profile?.name) {
-              await contactService.upsertContact(normalizedPhoneNumber, contact.profile.name);
-            }
-
             const mediaId = message.image?.id || 'unknown';
-            const storedMessage = {
-              from: normalizedPhoneNumber,
-              to: normalizePhoneNumber(metadata?.display_phone_number || 'Unknown'),
-              text: `[Image] media_id=${mediaId}`,
-              type: 'RECEIVED' as const,
-              status: 'DELIVERED' as const,
-              contactName,
-              whatsappMessageId: message.id,
-              conversationId: message.context?.id
-            };
-
-            const savedImageMessage = await messageService.addMessage(storedMessage);
-            console.log(`💾 Incoming image stored: ${contactName} (${normalizedPhoneNumber})`);
-            
-            // Broadcast new message to connected clients via SSE
-            try {
-              const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
-              broadcastMessage(
-                metadata?.phone_number_id || null,
-                normalizedPhoneNumber,
-                {
-                  id: savedImageMessage.id,
-                  from: normalizedPhoneNumber,
-                  to: storedMessage.to,
-                  text: storedMessage.text,
-                  timestamp: savedImageMessage.timestamp.toISOString(),
-                  type: 'received',
-                  status: 'delivered',
-                  contactName,
-                  whatsappMessageId: storedMessage.whatsappMessageId,
-                }
-              );
-              
-              if (metadata?.phone_number_id) {
-                broadcastActiveChatsUpdate(metadata.phone_number_id);
-              }
-            } catch (error) {
-              console.error('Error broadcasting image message:', error);
-            }
+            const result = await storeIncomingMessage({
+              message,
+              contacts,
+              metadata,
+              businessScope,
+              customerText: `[Image] media_id=${mediaId}`,
+            });
+            console.log(`💾 Incoming image stored: ${result.contactRecord?.name || result.targetKey} (${result.targetKey})`);
           } else if (message.type === 'audio' && message.from) {
             // Handle audio messages
             console.log(`🔊 Audio message received from ${message.from}`);
-            const normalizedPhoneNumber = normalizePhoneNumber(message.from);
-            await customerServiceWindowService.openWindow(normalizedPhoneNumber);
-
-            const contact = contacts.find((c: any) => c.wa_id === message.from);
-            const contactName = contact?.profile?.name || normalizedPhoneNumber;
-            if (contact?.profile?.name) {
-              await contactService.upsertContact(normalizedPhoneNumber, contact.profile.name);
-            }
-
             const mediaId = message.audio?.id || 'unknown';
-            const storedMessage = {
-              from: normalizedPhoneNumber,
-              to: normalizePhoneNumber(metadata?.display_phone_number || 'Unknown'),
-              text: `[Audio] media_id=${mediaId}`,
-              type: 'RECEIVED' as const,
-              status: 'DELIVERED' as const,
-              contactName,
-              whatsappMessageId: message.id,
-              conversationId: message.context?.id
-            };
-
-            const savedAudioMessage = await messageService.addMessage(storedMessage);
-            console.log(`💾 Incoming audio stored: ${contactName} (${normalizedPhoneNumber})`);
-            
-            // Broadcast new message to connected clients via SSE
-            try {
-              const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
-              broadcastMessage(
-                metadata?.phone_number_id || null,
-                normalizedPhoneNumber,
-                {
-                  id: savedAudioMessage.id,
-                  from: normalizedPhoneNumber,
-                  to: storedMessage.to,
-                  text: storedMessage.text,
-                  timestamp: savedAudioMessage.timestamp.toISOString(),
-                  type: 'received',
-                  status: 'delivered',
-                  contactName,
-                  whatsappMessageId: storedMessage.whatsappMessageId,
-                }
-              );
-              
-              if (metadata?.phone_number_id) {
-                broadcastActiveChatsUpdate(metadata.phone_number_id);
-              }
-            } catch (error) {
-              console.error('Error broadcasting audio message:', error);
-            }
+            const result = await storeIncomingMessage({
+              message,
+              contacts,
+              metadata,
+              businessScope,
+              customerText: `[Audio] media_id=${mediaId}`,
+            });
+            console.log(`💾 Incoming audio stored: ${result.contactRecord?.name || result.targetKey} (${result.targetKey})`);
           } else if (message.type === 'document' && message.from) {
             // Handle document messages
             console.log(`📄 Document message received from ${message.from}`);
-            const normalizedPhoneNumber = normalizePhoneNumber(message.from);
-            await customerServiceWindowService.openWindow(normalizedPhoneNumber);
-
-            const contact = contacts.find((c: any) => c.wa_id === message.from);
-            const contactName = contact?.profile?.name || normalizedPhoneNumber;
-            if (contact?.profile?.name) {
-              await contactService.upsertContact(normalizedPhoneNumber, contact.profile.name);
-            }
-
             const mediaId = message.document?.id || 'unknown';
             const fileName = message.document?.filename;
             const mimeType = message.document?.mime_type;
@@ -250,45 +221,14 @@ export async function POST(request: NextRequest) {
             if (mimeType) parts.push(`mimeType=${mimeType}`);
             const encodedText = parts.join('|');
 
-            const storedMessage = {
-              from: normalizedPhoneNumber,
-              to: normalizePhoneNumber(metadata?.display_phone_number || 'Unknown'),
-              text: encodedText,
-              type: 'RECEIVED' as const,
-              status: 'DELIVERED' as const,
-              contactName,
-              whatsappMessageId: message.id,
-              conversationId: message.context?.id
-            };
-
-            const savedDocumentMessage = await messageService.addMessage(storedMessage);
-            console.log(`💾 Incoming document stored: ${contactName} (${normalizedPhoneNumber})`);
-            
-            // Broadcast new message to connected clients via SSE
-            try {
-              const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../realtime/broadcast');
-              broadcastMessage(
-                metadata?.phone_number_id || null,
-                normalizedPhoneNumber,
-                {
-                  id: savedDocumentMessage.id,
-                  from: normalizedPhoneNumber,
-                  to: storedMessage.to,
-                  text: storedMessage.text,
-                  timestamp: savedDocumentMessage.timestamp.toISOString(),
-                  type: 'received',
-                  status: 'delivered',
-                  contactName,
-                  whatsappMessageId: storedMessage.whatsappMessageId,
-                }
-              );
-              
-              if (metadata?.phone_number_id) {
-                broadcastActiveChatsUpdate(metadata.phone_number_id);
-              }
-            } catch (error) {
-              console.error('Error broadcasting document message:', error);
-            }
+            const result = await storeIncomingMessage({
+              message,
+              contacts,
+              metadata,
+              businessScope,
+              customerText: encodedText,
+            });
+            console.log(`💾 Incoming document stored: ${result.contactRecord?.name || result.targetKey} (${result.targetKey})`);
           }
         }
       }

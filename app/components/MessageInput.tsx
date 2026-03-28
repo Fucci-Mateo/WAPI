@@ -68,7 +68,10 @@ export default function MessageInput({
   templateError,
   onCloseTemplates
 }: MessageInputProps) {
-  const { activeChat, windowStatus, selectedNumber, sendMediaMessage } = useAppStore();
+  const activeChat = useAppStore((state) => state.activeChat);
+  const windowStatus = useAppStore((state) => state.windowStatus);
+  const selectedNumber = useAppStore((state) => state.selectedNumber);
+  const sendMediaMessage = useAppStore((state) => state.sendMediaMessage);
 
   const canSendFreeForm = windowStatus?.canSendFreeForm ?? false;
   const canSendTemplate = windowStatus?.canSendTemplate ?? true;

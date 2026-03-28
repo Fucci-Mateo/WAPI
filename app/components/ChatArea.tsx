@@ -1,8 +1,9 @@
 "use client";
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import MessageBubble from './MessageBubble';
 import MessageInput from './MessageInput';
+import { normalizeWhatsAppIdentity } from '../lib/whatsappIdentity';
 
 import {
   Box,
@@ -14,37 +15,71 @@ import {
   useColorModeValue,
 } from '@chakra-ui/react';
 
+function formatDateHeader(date: Date): string {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const messageDate = new Date(date);
+  messageDate.setHours(0, 0, 0, 0);
+  const todayDate = new Date(today);
+  todayDate.setHours(0, 0, 0, 0);
+  const yesterdayDate = new Date(yesterday);
+  yesterdayDate.setHours(0, 0, 0, 0);
+
+  if (messageDate.getTime() === todayDate.getTime()) {
+    return 'Today';
+  }
+
+  if (messageDate.getTime() === yesterdayDate.getTime()) {
+    return 'Yesterday';
+  }
+
+  const currentYear = today.getFullYear();
+  if (messageDate.getFullYear() === currentYear) {
+    return messageDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+  }
+
+  return messageDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+}
+
+function isDifferentDate(date1: string, date2: string): boolean {
+  const d1 = new Date(date1);
+  const d2 = new Date(date2);
+  d1.setHours(0, 0, 0, 0);
+  d2.setHours(0, 0, 0, 0);
+  return d1.getTime() !== d2.getTime();
+}
+
 export default function ChatArea() {
-  const {
-    activeChat,
-    messages,
-    contactNames,
-    selectedNumber,
-    text,
-    onTextChange,
-    sendMessage,
-    sending,
-    error,
-    fetchTemplates,
-    loadingTemplates,
-    showTemplates,
-    templates,
-    selectedTemplate,
-    onTemplateSelect,
-    templateVariables,
-    onTemplateVariableChange,
-    sendTemplate,
-    sendingTemplate,
-    templateError,
-    onCloseTemplates,
-    fetchMessages,
-    fetchConversationMessages,
-    loadMoreConversationMessages,
-    conversationHasMore,
-    loadingConversationMore,
-    updateWindowStatus,
-    markMessagesAsRead,
-  } = useAppStore();
+  const activeChat = useAppStore((state) => state.activeChat);
+  const messages = useAppStore((state) => state.messages);
+  const activeChats = useAppStore((state) => state.activeChats);
+  const contactNames = useAppStore((state) => state.contactNames);
+  const selectedNumber = useAppStore((state) => state.selectedNumber);
+  const text = useAppStore((state) => state.text);
+  const onTextChange = useAppStore((state) => state.onTextChange);
+  const sendMessage = useAppStore((state) => state.sendMessage);
+  const sending = useAppStore((state) => state.sending);
+  const error = useAppStore((state) => state.error);
+  const fetchTemplates = useAppStore((state) => state.fetchTemplates);
+  const loadingTemplates = useAppStore((state) => state.loadingTemplates);
+  const showTemplates = useAppStore((state) => state.showTemplates);
+  const templates = useAppStore((state) => state.templates);
+  const selectedTemplate = useAppStore((state) => state.selectedTemplate);
+  const onTemplateSelect = useAppStore((state) => state.onTemplateSelect);
+  const templateVariables = useAppStore((state) => state.templateVariables);
+  const onTemplateVariableChange = useAppStore((state) => state.onTemplateVariableChange);
+  const sendTemplate = useAppStore((state) => state.sendTemplate);
+  const sendingTemplate = useAppStore((state) => state.sendingTemplate);
+  const templateError = useAppStore((state) => state.templateError);
+  const onCloseTemplates = useAppStore((state) => state.onCloseTemplates);
+  const fetchConversationMessages = useAppStore((state) => state.fetchConversationMessages);
+  const loadMoreConversationMessages = useAppStore((state) => state.loadMoreConversationMessages);
+  const conversationHasMore = useAppStore((state) => state.conversationHasMore);
+  const loadingConversationMore = useAppStore((state) => state.loadingConversationMore);
+  const updateWindowStatus = useAppStore((state) => state.updateWindowStatus);
+  const markMessagesAsRead = useAppStore((state) => state.markMessagesAsRead);
 
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -55,79 +90,57 @@ export default function ChatArea() {
   const textColor = useColorModeValue('gray.800', 'white');
   const secondaryTextColor = useColorModeValue('gray.600', 'gray.400');
   const headerBgColor = useColorModeValue('white', 'gray.800');
-  const statusBgColor = useColorModeValue('gray.50', 'gray.700');
 
   // Window status state
   const [windowStatus, setWindowStatus] = useState<any>(null);
   const [timeRemaining, setTimeRemaining] = useState<string>('');
+  const activeChatIdentity = useMemo(() => normalizeWhatsAppIdentity(activeChat), [activeChat]);
+  const activeChatNameByIdentity = useMemo(() => {
+    const names: Record<string, string> = {};
 
-  // Normalize phone number format (remove + prefix, spaces, and URL encoding for consistency)
-  const normalizePhoneNumber = (phone: string): string => {
-    if (!phone) return '';
-    // Remove + prefix
-    let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-    // Remove all spaces and URL encoding
-    normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-    return normalized;
-  };
-
-  // Filter messages for the active chat, ensuring we only show customer messages
-  const chatMessages = messages.filter((msg) => {
-    if (!activeChat) return false;
-    
-    const normalizedActiveChat = normalizePhoneNumber(activeChat);
-    
-    // For received messages, show if the customer (from) matches activeChat
-    if (msg.type === 'received' && normalizePhoneNumber(msg.from) === normalizedActiveChat) {
-      return true;
-    }
-    
-    // For sent messages, show if the customer (to) matches activeChat
-    if (msg.type === 'sent' && normalizePhoneNumber(msg.to) === normalizedActiveChat) {
-      return true;
-    }
-    
-    return false;
-  }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()); // Sort by timestamp ascending (oldest first)
-
-  // Helper function to format date for display
-  const formatDateHeader = (date: Date): string => {
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    
-    // Reset time to compare dates only
-    const messageDate = new Date(date);
-    messageDate.setHours(0, 0, 0, 0);
-    const todayDate = new Date(today);
-    todayDate.setHours(0, 0, 0, 0);
-    const yesterdayDate = new Date(yesterday);
-    yesterdayDate.setHours(0, 0, 0, 0);
-    
-    if (messageDate.getTime() === todayDate.getTime()) {
-      return 'Today';
-    } else if (messageDate.getTime() === yesterdayDate.getTime()) {
-      return 'Yesterday';
-    } else {
-      // Format as "Month Day, Year" or "Month Day" if same year
-      const year = messageDate.getFullYear();
-      const currentYear = today.getFullYear();
-      if (year === currentYear) {
-        return messageDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
-      } else {
-        return messageDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    for (const chat of activeChats) {
+      const resolvedName = chat.contactName || chat.phoneNumber || chat.chatKey || 'Unknown';
+      for (const alias of [chat.phoneNumber, chat.chatKey]) {
+        const normalized = normalizeWhatsAppIdentity(alias);
+        if (normalized) {
+          names[normalized] = resolvedName;
+        }
       }
     }
-  };
 
-  // Helper function to check if two messages are on different dates
-  const isDifferentDate = (date1: string, date2: string): boolean => {
-    const d1 = new Date(date1);
-    const d2 = new Date(date2);
-    d1.setHours(0, 0, 0, 0);
-    d2.setHours(0, 0, 0, 0);
-    return d1.getTime() !== d2.getTime();
-  };
+    return names;
+  }, [activeChats]);
+
+  const chatMessages = useMemo(() => {
+    if (!activeChatIdentity) return [];
+
+    return messages
+      .filter((msg) => {
+        const messageConversationKey = normalizeWhatsAppIdentity(msg.conversationKey || '');
+        const messageAliases = (msg.conversationAliases || [])
+          .map((alias) => normalizeWhatsAppIdentity(alias))
+          .filter(Boolean);
+
+        if (messageAliases.includes(activeChatIdentity)) {
+          return true;
+        }
+
+        if (messageConversationKey && messageConversationKey === activeChatIdentity) {
+          return true;
+        }
+
+        if (msg.type === 'received' && normalizeWhatsAppIdentity(msg.from) === activeChatIdentity) {
+          return true;
+        }
+
+        if (msg.type === 'sent' && normalizeWhatsAppIdentity(msg.to) === activeChatIdentity) {
+          return true;
+        }
+
+        return false;
+      })
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  }, [messages, activeChatIdentity]);
 
   // Check if user is at bottom of messages
   const [isAtBottom, setIsAtBottom] = useState(true);
@@ -317,7 +330,11 @@ export default function ChatArea() {
         // Update the store (which MessageInput reads from)
         await updateWindowStatus(activeChat);
         // Also update local state for display in ChatArea
-        const response = await fetch(`/api/window-status?phone=${activeChat}`);
+        const params = new URLSearchParams({ phone: normalizeWhatsAppIdentity(activeChat) });
+        if (selectedNumber?.numberId) {
+          params.append('numberId', selectedNumber.numberId);
+        }
+        const response = await fetch(`/api/window-status?${params.toString()}`);
         if (response.ok) {
           const status = await response.json();
           setWindowStatus(status);
@@ -338,7 +355,7 @@ export default function ChatArea() {
     return () => {
       clearInterval(statusInterval);
     };
-  }, [activeChat]);
+  }, [activeChat, fetchConversationMessages, selectedNumber?.numberId, updateWindowStatus]);
 
   // Mark messages as read when chat is visible and has messages
   useEffect(() => {
@@ -354,10 +371,16 @@ export default function ChatArea() {
     return () => {
       clearTimeout(markReadTimer);
     };
-  }, [activeChat, selectedNumber?.numberId, chatMessages.length]);
+  }, [activeChat, chatMessages.length, markMessagesAsRead, selectedNumber?.numberId]);
 
   const getDisplayName = (phoneNumber: string) => {
-    return contactNames[phoneNumber] || phoneNumber;
+    const normalized = normalizeWhatsAppIdentity(phoneNumber);
+    return (
+      (normalized ? activeChatNameByIdentity[normalized] : undefined) ||
+      (normalized ? contactNames[normalized] : undefined) ||
+      contactNames[phoneNumber] ||
+      phoneNumber
+    );
   };
 
   const handleSend = (e: React.FormEvent) => {

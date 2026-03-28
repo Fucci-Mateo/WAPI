@@ -1,20 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authenticateClient, pickHeadersForLog, hasScope, SCOPES } from '@/app/lib/extAuth';
-import { prisma, templateDB } from '@/app/lib/database';
-import { MessageDatabaseService, CustomerServiceWindowDatabaseService } from '@/app/lib/database';
+import { prisma, templateDB, BusinessNumberDatabaseService, ContactDatabaseService, conversationSummaryDB } from '@/app/lib/database';
+import { MessageDatabaseService } from '@/app/lib/database';
+import { getCanonicalContactIdentity, getContactIdentityAliases, normalizeWhatsAppIdentity } from '@/app/lib/whatsappIdentity';
 
 const messageService = new MessageDatabaseService();
-const customerServiceWindowService = new CustomerServiceWindowDatabaseService();
-
-// Normalize phone number format (remove + prefix, spaces, and URL encoding for consistency)
-const normalizePhoneNumber = (phone: string): string => {
-  if (!phone) return '';
-  // Remove + prefix
-  let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-  // Remove all spaces and URL encoding
-  normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-  return normalized;
-};
+const businessNumberService = new BusinessNumberDatabaseService();
+const contactService = new ContactDatabaseService();
 
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v19.0';
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -62,7 +54,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!to) {
-      return NextResponse.json({ error: 'Recipient phone number (to) is required' }, { status: 400 });
+      return NextResponse.json({ error: 'Recipient identifier (to) is required' }, { status: 400 });
     }
 
     // Check if client has permission to send this template
@@ -117,7 +109,7 @@ export async function POST(req: NextRequest) {
     // Build WhatsApp API request body
     const messageBody: any = {
       messaging_product: 'whatsapp',
-      to,
+      to: normalizeWhatsAppIdentity(to),
       type: 'template',
       template: {
         name: templateName,
@@ -164,7 +156,9 @@ export async function POST(req: NextRequest) {
 
     // Store the sent template message in database
     if (messageId) {
-      const normalizedTo = normalizePhoneNumber(to);
+      const normalizedTo = normalizeWhatsAppIdentity(to);
+      const businessNumber = await businessNumberService.getByNumberId(numberId);
+      const businessScope = businessNumber?.wabaId || null;
       try {
         // Extract parameter values from components for storage
         // Format: { "HEADER_0": "value1", "BODY_0": "value2", "BODY_1": "value3", ... }
@@ -204,7 +198,7 @@ export async function POST(req: NextRequest) {
           });
         }
         
-        await messageService.addMessage({
+        const savedMessage = await messageService.addMessage({
           from: numberId,
           to: normalizedTo,
           text: `[Template: ${templateName}]`,
@@ -214,8 +208,56 @@ export async function POST(req: NextRequest) {
           templateParameters: Object.keys(templateParams).length > 0 ? templateParams : undefined,
         });
 
-        // Refresh the customer service window for the recipient
-        await customerServiceWindowService.openWindow(normalizedTo);
+        const recipientContact = await contactService.getContact(normalizedTo, businessScope);
+        const recipientAliases = recipientContact ? getContactIdentityAliases(recipientContact) : [normalizedTo];
+        const canonicalConversationKey = recipientContact ? getCanonicalContactIdentity(recipientContact) : normalizedTo;
+        const summary = await conversationSummaryDB.upsertFromMessage({
+          businessNumberId: numberId,
+          message: {
+            from: numberId,
+            to: normalizedTo,
+            text: `[Template: ${templateName}]`,
+            type: 'SENT',
+            status: 'SENDING',
+            contactName: recipientContact?.name || null,
+            templateParameters: Object.keys(templateParams).length > 0 ? templateParams : null,
+            timestamp: savedMessage.timestamp,
+          },
+          contact: recipientContact
+            ? {
+                id: recipientContact.id,
+                phoneNumber: recipientContact.phoneNumber,
+                businessScopedUserId: recipientContact.businessScopedUserId,
+                whatsappId: recipientContact.whatsappId,
+                name: recipientContact.name,
+              }
+            : null,
+          businessScope,
+        });
+
+        try {
+          const { broadcastMessage, broadcastActiveChatsUpdate } = await import('../../../realtime/broadcast');
+          broadcastMessage(
+            numberId,
+            recipientAliases,
+            {
+              id: savedMessage.id,
+              from: numberId,
+              to: normalizedTo,
+              text: `[Template: ${templateName}]`,
+              timestamp: savedMessage.timestamp.toISOString(),
+              type: 'sent',
+              status: 'sending',
+              whatsappMessageId: messageId,
+              conversationKey: canonicalConversationKey,
+              conversationAliases: recipientAliases,
+            }
+          );
+
+          broadcastActiveChatsUpdate(numberId, summary || undefined);
+        } catch (broadcastError) {
+          console.error('Failed to broadcast template message:', broadcastError);
+        }
       } catch (dbError) {
         // Log but don't fail the request if DB write fails
         console.error('Failed to store template message in database:', dbError);
@@ -254,4 +296,3 @@ export async function POST(req: NextRequest) {
     } catch {}
   }
 }
-

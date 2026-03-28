@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { normalizeWhatsAppIdentity, isLikelyPhoneIdentity, isLikelyBusinessScopedUserId } from './whatsappIdentity';
 
 // Phone number validation - WhatsApp format
 export const phoneNumberSchema = z
@@ -12,6 +13,16 @@ export const phoneNumberSchema = z
     return cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
   });
 
+export const whatsappRecipientSchema = z
+  .string()
+  .min(1, 'Recipient is required')
+  .max(128, 'Recipient is too long')
+  .transform((val) => normalizeWhatsAppIdentity(val))
+  .refine(
+    (val) => isLikelyPhoneIdentity(val) || isLikelyBusinessScopedUserId(val),
+    'Recipient must be a phone number or a WhatsApp business-scoped user ID'
+  );
+
 // Message validation
 export const messageSchema = z.object({
   text: z
@@ -19,7 +30,7 @@ export const messageSchema = z.object({
     .min(1, 'Message cannot be empty')
     .max(1000, 'Message too long (max 1000 characters)')
     .transform((val) => val.trim()),
-  to: phoneNumberSchema,
+  to: whatsappRecipientSchema,
 });
 
 // Template validation
@@ -39,13 +50,13 @@ export const templateVariablesSchema = z.record(
 
 // API request validation
 export const sendMessageSchema = z.object({
-  to: phoneNumberSchema,
+  to: whatsappRecipientSchema,
   text: z.string().min(1, 'Message text is required').max(1000),
   numberId: z.string().min(1, 'Number ID is required'),
 });
 
 export const sendTemplateSchema = z.object({
-  to: phoneNumberSchema,
+  to: whatsappRecipientSchema,
   templateName: z.string().min(1, 'Template name is required'),
   language: z.string().min(2, 'Language code is required'),
   components: z.array(z.object({
@@ -87,8 +98,17 @@ export const validateMessage = (data: any): { success: true; data: any } | { suc
   }
 };
 
+export const validateWhatsAppRecipient = (recipient: string): { success: true; data: string } | { success: false; error: string } => {
+  try {
+    return { success: true, data: whatsappRecipientSchema.parse(recipient) };
+  } catch (error) {
+    return { success: false, error: 'Invalid WhatsApp recipient identifier' };
+  }
+};
+
 // Type exports for TypeScript
 export type PhoneNumber = z.infer<typeof phoneNumberSchema>;
+export type WhatsAppRecipient = z.infer<typeof whatsappRecipientSchema>;
 export type Message = z.infer<typeof messageSchema>;
 export type Template = z.infer<typeof templateSchema>;
 export type SendMessageRequest = z.infer<typeof sendMessageSchema>;

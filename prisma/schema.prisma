@@ -100,7 +100,8 @@ model Message {
 
 model CustomerServiceWindow {
   id        String   @id @default(cuid())
-  phoneNumber String @unique // Customer phone number
+  wabaId    String   // WhatsApp Business Account ID / scope
+  phoneNumber String // Customer identity (phone number or BSUID)
   isOpen    Boolean  @default(false)
   openedAt  DateTime @default(now())
   expiresAt DateTime
@@ -111,6 +112,8 @@ model CustomerServiceWindow {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([wabaId, phoneNumber])
+  @@index([wabaId])
   @@index([phoneNumber])
   @@index([expiresAt])
   @@index([isOpen])
@@ -118,20 +121,50 @@ model CustomerServiceWindow {
 
 model Contact {
   id          String   @id @default(cuid())
-  phoneNumber String   @unique
+  wabaId      String   // WhatsApp Business Account ID / scope
+  phoneNumber String?  // Customer phone number when available
+  businessScopedUserId String? // BSUID / username-scoped WhatsApp identity
   name        String?
   email       String?
   company     String?
   
   // WhatsApp specific
-  whatsappId  String? // WhatsApp's wa_id
+  whatsappId  String? // Legacy/raw WhatsApp wa_id (kept for compatibility)
   
   // Metadata
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  @@unique([wabaId, phoneNumber])
+  @@unique([wabaId, businessScopedUserId])
+  @@index([wabaId])
   @@index([phoneNumber])
+  @@index([businessScopedUserId])
   @@index([name])
+}
+
+model ConversationSummary {
+  id                 String        @id @default(cuid())
+  businessNumberId   String        // WhatsApp phone_number_id / inbox scope
+  chatKey            String        // Canonical customer identity
+  phoneNumber        String?       // Display phone when available
+  businessScopedUserId String?     // Display BSUID when available
+  contactId          String?       // Optional resolved contact record
+  contactName        String?
+  lastMessage        String?
+  lastMessageTimestamp DateTime?
+  lastMessageType    MessageType?
+  unreadCount        Int           @default(0)
+  templateParameters Json?
+
+  // Metadata
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  @@unique([businessNumberId, chatKey])
+  @@index([businessNumberId])
+  @@index([businessNumberId, lastMessageTimestamp])
+  @@index([businessNumberId, unreadCount])
 }
 
 model Template {

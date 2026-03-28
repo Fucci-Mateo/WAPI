@@ -9,7 +9,8 @@ import NewChatForm from './NewChatForm';
 import LoadingScreen from './LoadingScreen';
 import UserProfile from './UserProfile';
 import SSEProvider from './SSEProvider';
-import { Flex, useColorModeValue, Box, HStack, Text, VStack } from '@chakra-ui/react';
+import packageJson from '../../package.json';
+import { Badge, Flex, useColorModeValue, Box, HStack, Text, VStack } from '@chakra-ui/react';
 
 interface WhatsAppInterfaceProps {
   numberOptions: NumberOption[];
@@ -20,21 +21,20 @@ export default function WhatsAppInterface({ numberOptions }: WhatsAppInterfacePr
   const emptyStateBg = useColorModeValue('white', 'gray.800');
   const emptyStateBorder = useColorModeValue('gray.200', 'gray.700');
   const emptyStateText = useColorModeValue('gray.600', 'gray.300');
+  const appVersion = packageJson.version;
 
-  const {
-    selectedNumber,
-    setSelectedNumber,
-    isLoading,
-    setIsLoading,
-    activeChat,
-    isNewChat,
-    newChatNumber,
-    setNewChatNumber,
-    setIsNewChat,
-    startNewChat,
-    cancelNewChat,
-    fetchMessages,
-  } = useAppStore();
+  const selectedNumber = useAppStore((state) => state.selectedNumber);
+  const setSelectedNumber = useAppStore((state) => state.setSelectedNumber);
+  const isLoading = useAppStore((state) => state.isLoading);
+  const setIsLoading = useAppStore((state) => state.setIsLoading);
+  const activeChat = useAppStore((state) => state.activeChat);
+  const isNewChat = useAppStore((state) => state.isNewChat);
+  const newChatNumber = useAppStore((state) => state.newChatNumber);
+  const setNewChatNumber = useAppStore((state) => state.setNewChatNumber);
+  const setIsNewChat = useAppStore((state) => state.setIsNewChat);
+  const startNewChat = useAppStore((state) => state.startNewChat);
+  const cancelNewChat = useAppStore((state) => state.cancelNewChat);
+  const fetchMessages = useAppStore((state) => state.fetchMessages);
 
   // Initialize selected number when numberOptions are available
   useEffect(() => {
@@ -103,11 +103,23 @@ export default function WhatsAppInterface({ numberOptions }: WhatsAppInterfacePr
         {/* Header with User Profile */}
         <Box p={4} borderBottom="1px" borderColor="gray.200">
           <HStack justify="space-between">
-            <Box>
-              <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+            <HStack spacing={3} align="center">
+              <Text fontSize="1.5rem" fontWeight="bold" lineHeight="1">
                 WhatsApp Business Manager
-              </h2>
-            </Box>
+              </Text>
+              <Badge
+                colorScheme="gray"
+                variant="subtle"
+                borderRadius="full"
+                px={2}
+                py={1}
+                fontSize="0.7rem"
+                letterSpacing="0.08em"
+                textTransform="uppercase"
+              >
+                v{appVersion}
+              </Badge>
+            </HStack>
             <UserProfile />
           </HStack>
         </Box>

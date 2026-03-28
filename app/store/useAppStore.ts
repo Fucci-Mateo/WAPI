@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { Message, Template, NumberOption, ActiveChat } from '../components/types';
-import { validatePhoneNumber, validateMessage } from '../lib/validation';
+import { validateMessage, validateWhatsAppRecipient } from '../lib/validation';
+import { normalizeWhatsAppIdentity } from '../lib/whatsappIdentity';
 import { toast } from 'react-hot-toast';
 
 // Add WindowStatus interface for client-side use
@@ -114,19 +115,40 @@ interface AppState {
   fetchActiveChats: () => Promise<void>;
   setActiveChats: (chats: ActiveChat[]) => void;
   setLoadingActiveChats: (loading: boolean) => void;
+  upsertActiveChat: (chat: ActiveChat) => void;
   
   // Mark Messages as Read
   markMessagesAsRead: (phoneNumber: string) => Promise<void>;
 }
 
-async function fetchWindowStatus(phoneNumber: string) {
+async function fetchWindowStatus(identity: string, numberId?: string | null) {
   try {
-    const res = await fetch(`/api/window-status?phone=${encodeURIComponent(phoneNumber)}`);
+    const params = new URLSearchParams({ phone: identity });
+    if (numberId) {
+      params.append('numberId', numberId);
+    }
+    const res = await fetch(`/api/window-status?${params.toString()}`);
     if (!res.ok) return null;
     return await res.json();
   } catch {
     return null;
   }
+}
+
+function getActiveChatIdentity(chat: ActiveChat): string {
+  return normalizeWhatsAppIdentity(chat.chatKey || chat.phoneNumber);
+}
+
+function mergeActiveChat(existingChats: ActiveChat[], chat: ActiveChat): ActiveChat[] {
+  const nextIdentity = getActiveChatIdentity(chat);
+  const filtered = existingChats.filter((existing) => getActiveChatIdentity(existing) !== nextIdentity);
+  const merged = [...filtered, chat];
+
+  return merged.sort((a, b) => {
+    const aTimestamp = a.lastMessageTimestamp ? new Date(a.lastMessageTimestamp).getTime() : 0;
+    const bTimestamp = b.lastMessageTimestamp ? new Date(b.lastMessageTimestamp).getTime() : 0;
+    return bTimestamp - aTimestamp;
+  });
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -197,12 +219,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   setSelectedNumber: (number) => set({ selectedNumber: number }),
   setActiveChat: (chat) => {
     const { resetConversationPagination, markMessagesAsRead, selectedNumber } = get();
+    const normalizedChat = normalizeWhatsAppIdentity(chat);
     resetConversationPagination();
-    set({ activeChat: chat });
+    set({ activeChat: normalizedChat });
     
     // Mark messages as read when opening a chat
-    if (chat && selectedNumber?.numberId) {
-      markMessagesAsRead(chat).catch(error => {
+    if (normalizedChat && selectedNumber?.numberId) {
+      markMessagesAsRead(normalizedChat).catch(error => {
         console.error('Error marking messages as read:', error);
       });
     }
@@ -226,9 +249,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Active Chats Actions
   setActiveChats: (chats: ActiveChat[]) => set({ activeChats: chats }),
   setLoadingActiveChats: (loading: boolean) => set({ loadingActiveChats: loading }),
+  upsertActiveChat: (chat: ActiveChat) => set((state) => {
+    const nextContactNames = { ...state.contactNames };
+    if (chat.contactName) {
+      const phoneKey = normalizeWhatsAppIdentity(chat.phoneNumber);
+      const chatKey = normalizeWhatsAppIdentity(chat.chatKey || chat.phoneNumber);
+      if (phoneKey) {
+        nextContactNames[phoneKey] = chat.contactName;
+      }
+      if (chatKey) {
+        nextContactNames[chatKey] = chat.contactName;
+      }
+    }
+
+    return {
+      activeChats: mergeActiveChat(state.activeChats, chat),
+      contactNames: nextContactNames,
+    };
+  }),
   
   fetchActiveChats: async () => {
-    const { selectedNumber, setActiveChats, setLoadingActiveChats, setContactNames } = get();
+    const { selectedNumber, setActiveChats, setLoadingActiveChats } = get();
     
     if (!selectedNumber?.numberId) {
       console.log('🔍 fetchActiveChats: No selected number, skipping');
@@ -247,15 +288,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (response.ok) {
         console.log(`📋 Fetched ${data.contacts?.length || 0} active contacts`);
         setActiveChats(data.contacts || []);
-        
-        // Update contact names in the store
-        const contactNames: Record<string, string> = {};
-        (data.contacts || []).forEach((contact: ActiveChat) => {
-          if (contact.contactName) {
-            contactNames[contact.phoneNumber] = contact.contactName;
-          }
-        });
-        setContactNames(contactNames);
       } else {
         console.error('Failed to fetch active chats:', data.error);
         setActiveChats([]);
@@ -269,10 +301,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   
   markMessagesAsRead: async (phoneNumber: string) => {
-    const { selectedNumber, fetchActiveChats } = get();
+    const { selectedNumber, fetchActiveChats, upsertActiveChat } = get();
+    const normalizedIdentity = normalizeWhatsAppIdentity(phoneNumber);
     
-    if (!selectedNumber?.numberId || !phoneNumber) {
-      console.log('⚠️ Cannot mark messages as read: missing numberId or phoneNumber');
+    if (!selectedNumber?.numberId || !normalizedIdentity) {
+      console.log('⚠️ Cannot mark messages as read: missing numberId or identity');
       return;
     }
     
@@ -283,7 +316,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          phoneNumber,
+          phoneNumber: normalizedIdentity,
           numberId: selectedNumber.numberId,
         }),
       });
@@ -291,10 +324,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       const data = await response.json();
       
       if (response.ok) {
-        console.log(`✅ Marked ${data.marked || 0} message(s) as read for ${phoneNumber}`);
-        
-        // Refresh active chats to get updated unread counts
-        fetchActiveChats();
+        console.log(`✅ Marked ${data.marked || 0} message(s) as read for ${normalizedIdentity}`);
+
+        if (data.summary) {
+          upsertActiveChat(data.summary);
+        } else {
+          // Refresh active chats as a fallback when the API does not return a summary row.
+          fetchActiveChats();
+        }
       } else {
         console.error('❌ Failed to mark messages as read:', data.error);
       }
@@ -308,6 +345,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       messages,
       setMessages,
       setContactNames,
+      selectedNumber,
       setConversationHasMore,
       setLoadingConversationMore,
       setConversationOffset,
@@ -315,13 +353,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       markMessagesAsRead,
     } = get();
     
-    // Helper to normalize phone numbers for comparison
-    const normalizePhoneNumber = (phone: string): string => {
-      if (!phone) return '';
-      let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-      normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-      return normalized;
-    };
+    const normalizedConversationKey = normalizeWhatsAppIdentity(phoneNumber);
+    const businessNumberId = selectedNumber?.numberId || null;
     
     try {
       // Reset pagination if not appending and not polling (initial load only)
@@ -345,7 +378,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       
       console.log(`🔍 fetchConversationMessages: phoneNumber=${phoneNumber}, append=${append}, polling=${polling}, conversationOffset=${conversationOffset}, calculatedOffset=${offset}`);
       
-      const url = `/api/messages?phoneNumber=${encodeURIComponent(phoneNumber)}&offset=${offset}&limit=${limit}`;
+      const params = new URLSearchParams({
+        phoneNumber: normalizedConversationKey,
+        offset: String(offset),
+        limit: String(limit),
+      });
+      if (businessNumberId) {
+        params.append('businessNumberId', businessNumberId);
+      }
+      const url = `/api/messages?${params.toString()}`;
       
       console.log(`🔍 Fetching from URL: ${url}`);
       
@@ -415,10 +456,24 @@ export const useAppStore = create<AppState>((set, get) => ({
             media,
             userId: msg.userId,
             userName: msg.userName,
+            conversationKey: msg.conversationKey || normalizedConversationKey,
+            conversationAliases: msg.conversationAliases || [normalizedConversationKey],
           };
         });
         
-        const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
+        const messageMatchesConversation = (msg: Message) => {
+          const aliases = (msg.conversationAliases || []).map((alias) => normalizeWhatsAppIdentity(alias)).filter(Boolean);
+          if (aliases.includes(normalizedConversationKey)) {
+            return true;
+          }
+
+          const messageKey = normalizeWhatsAppIdentity(msg.conversationKey || '');
+          if (messageKey && messageKey === normalizedConversationKey) return true;
+
+          const msgFrom = normalizeWhatsAppIdentity(msg.from);
+          const msgTo = normalizeWhatsAppIdentity(msg.to);
+          return msgFrom === normalizedConversationKey || msgTo === normalizedConversationKey;
+        };
         
         // Handle append mode: prepend older messages (they come in DESC order, so reverse for prepend)
         if (append) {
@@ -444,13 +499,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         } else if (polling) {
           // Polling mode: fetch latest messages and append only new ones
           // Don't reset pagination state - preserve conversationOffset and conversationHasMore
-          const normalizedPhone = normalizePhoneNumber(phoneNumber);
           
           // Get existing messages for this conversation
           const existingConversationMessages = messages.filter(msg => {
-            const msgFrom = normalizePhoneNumber(msg.from);
-            const msgTo = normalizePhoneNumber(msg.to);
-            return msgFrom === normalizedPhone || msgTo === normalizedPhone;
+            return messageMatchesConversation(msg);
           });
           
           // Messages come in DESC order (newest first), reverse to get chronological order
@@ -461,9 +513,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           if (newMessages.length > 0) {
             // Get messages from other conversations
             const otherMessages = messages.filter(msg => {
-              const msgFrom = normalizePhoneNumber(msg.from);
-              const msgTo = normalizePhoneNumber(msg.to);
-              return !(msgFrom === normalizedPhone || msgTo === normalizedPhone);
+              return !messageMatchesConversation(msg);
             });
             
             // Merge: other conversations + existing conversation messages + new messages
@@ -479,13 +529,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         } else {
           // Initial load: remove existing messages for this conversation and add new ones
           // Keep messages from other conversations
-          const normalizedPhone = normalizePhoneNumber(phoneNumber);
           const otherMessages = messages.filter(msg => {
-            // Check if message belongs to this conversation
-            const msgFrom = normalizePhoneNumber(msg.from);
-            const msgTo = normalizePhoneNumber(msg.to);
-            // Message belongs to this conversation if from or to matches
-            return !(msgFrom === normalizedPhone || msgTo === normalizedPhone);
+            return !messageMatchesConversation(msg);
           });
           
           // Reverse to show oldest first (messages come DESC from server)
@@ -515,7 +560,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         
         // Mark messages as read when fetching conversation (only on initial load, not append/polling)
         if (!append && !polling) {
-          markMessagesAsRead(phoneNumber).catch(error => {
+          markMessagesAsRead(normalizedConversationKey).catch(error => {
             console.error('Error marking messages as read after fetch:', error);
           });
         }
@@ -544,13 +589,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   
   // Customer Service Window Actions
   updateWindowStatus: async (phoneNumber) => {
-    const status = await fetchWindowStatus(phoneNumber);
+    const { selectedNumber } = get();
+    const status = await fetchWindowStatus(normalizeWhatsAppIdentity(phoneNumber), selectedNumber?.numberId || null);
     set({ windowStatus: status });
   },
   
   recordUserMessage: async (phoneNumber) => {
     // The server will update the window on incoming message, so just fetch the latest status
-    const status = await fetchWindowStatus(phoneNumber);
+    const { selectedNumber } = get();
+    const status = await fetchWindowStatus(normalizeWhatsAppIdentity(phoneNumber), selectedNumber?.numberId || null);
     set({ windowStatus: status });
   },
   
@@ -593,15 +640,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       return;
     }
     
-    // Validate phone number format
-    const phoneValidation = validatePhoneNumber(activeChat);
-    if (!phoneValidation.success) {
-      toast.error(phoneValidation.error);
+    const recipientValidation = validateWhatsAppRecipient(activeChat);
+    if (!recipientValidation.success) {
+      toast.error(recipientValidation.error);
       return;
     }
+    const recipientIdentity = recipientValidation.data;
     
     // Validate message
-    const messageValidation = validateMessage({ text, to: activeChat });
+    const messageValidation = validateMessage({ text, to: recipientIdentity });
     if (!messageValidation.success) {
       toast.error(messageValidation.error);
       return;
@@ -614,11 +661,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const newMessage: Message = {
       id: messageId,
       from: selectedNumber.numberId, // Use the actual business phone number, not the label
-      to: activeChat,
+      to: recipientIdentity,
       text,
       timestamp: new Date().toISOString(),
       type: 'sent',
-      status: 'sending'
+      status: 'sending',
+      conversationKey: recipientIdentity,
+      conversationAliases: [recipientIdentity],
     };
     
     addMessage(newMessage);
@@ -627,16 +676,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const loadingToast = toast.loading('Sending message...');
     
     try {
-      // Use the validated phone number (already has + prefix)
-      const validatedPhone = phoneValidation.data;
-      
       const res = await fetch("/api/send", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          to: validatedPhone,
+          to: recipientIdentity,
           text,
           numberId: selectedNumber.numberId,
         }),
@@ -648,9 +694,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         updateMessageStatus(messageId, 'sent');
         toast.success('Message sent successfully!', { id: loadingToast });
         
-        // Refresh the customer service window status after sending
-        // This ensures the window stays open for subsequent messages
-        updateWindowStatus(activeChat);
+        // Re-fetch the customer service window status so the UI countdown stays in sync
+        updateWindowStatus(recipientIdentity);
       } else {
         updateMessageStatus(messageId, 'failed');
         toast.error(data.error || 'Failed to send message', { id: loadingToast });
@@ -690,12 +735,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       return false;
     }
     
-    // Validate phone number format
-    const phoneValidation = validatePhoneNumber(activeChat);
-    if (!phoneValidation.success) {
-      toast.error(phoneValidation.error);
+    const recipientValidation = validateWhatsAppRecipient(activeChat);
+    if (!recipientValidation.success) {
+      toast.error(recipientValidation.error);
       return false;
     }
+    const recipientIdentity = recipientValidation.data;
     
     setSending(true);
     setError('');
@@ -707,11 +752,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const newMessage: Message = {
       id: messageId,
       from: selectedNumber.numberId,
-      to: activeChat,
+      to: recipientIdentity,
       text: messageText,
       timestamp: new Date().toISOString(),
       type: 'sent',
       status: 'sending',
+      conversationKey: recipientIdentity,
+      conversationAliases: [recipientIdentity],
       media: {
         kind: mediaType,
         id: mediaId,
@@ -727,15 +774,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const loadingToast = toast.loading('Sending media...');
     
     try {
-      const validatedPhone = phoneValidation.data;
-      
       const res = await fetch("/api/send", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          to: validatedPhone,
+          to: recipientIdentity,
           numberId: selectedNumber.numberId,
           mediaId,
           mediaType,
@@ -750,7 +795,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (res.ok) {
         updateMessageStatus(messageId, 'sent');
         toast.success('Media sent successfully!', { id: loadingToast });
-        updateWindowStatus(activeChat);
+        // Re-fetch the customer service window status so the UI countdown stays in sync
+        updateWindowStatus(recipientIdentity);
         return true;
       } else {
         updateMessageStatus(messageId, 'failed');
@@ -897,6 +943,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           media,
           userId: msg.userId,
           userName: msg.userName,
+          conversationKey: msg.conversationKey,
+          conversationAliases: msg.conversationAliases,
         });
         });
         
@@ -984,7 +1032,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   
   sendTemplate: async () => {
-    const { selectedTemplate, selectedNumber, activeChat, templateVariables, addMessage, updateMessageStatus, setSendingTemplate, setError, setSelectedTemplate, setTemplateVariables, setShowTemplates, canSendMessageType } = get();
+    const { selectedTemplate, selectedNumber, activeChat, templateVariables, addMessage, updateMessageStatus, setSendingTemplate, setError, setSelectedTemplate, setTemplateVariables, setShowTemplates, canSendMessageType, updateWindowStatus } = get();
     
     if (!selectedTemplate || !selectedNumber || !activeChat) {
       toast.error('Please select a template and ensure chat is active');
@@ -997,12 +1045,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       return;
     }
     
-    // Validate phone number format
-    const phoneValidation = validatePhoneNumber(activeChat);
-    if (!phoneValidation.success) {
-      toast.error(phoneValidation.error);
+    const recipientValidation = validateWhatsAppRecipient(activeChat);
+    if (!recipientValidation.success) {
+      toast.error(recipientValidation.error);
       return;
     }
+    const recipientIdentity = recipientValidation.data;
     
     setSendingTemplate(true);
     setError('');
@@ -1010,12 +1058,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     const messageId = Date.now().toString();
     const newMessage: Message = {
       id: messageId,
-      from: selectedNumber.label,
-      to: activeChat,
+      from: selectedNumber.numberId,
+      to: recipientIdentity,
       text: `Template: ${selectedTemplate.name}`,
       timestamp: new Date().toISOString(),
       type: 'sent',
-      status: 'sending'
+      status: 'sending',
+      conversationKey: recipientIdentity,
+      conversationAliases: [recipientIdentity],
     };
     
     addMessage(newMessage);
@@ -1110,12 +1160,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         };
       }).filter((comp: any) => comp !== null); // Remove null components
 
-      // Use validated phone number (already has + prefix)
-      const validatedPhone = phoneValidation.data;
-      
       // Log the request payload for debugging
       const requestPayload = {
-        to: validatedPhone,
+        to: recipientIdentity,
         templateName: selectedTemplate.name,
         language: selectedTemplate.language,
         components,
@@ -1139,6 +1186,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         setSelectedTemplate(null);
         setTemplateVariables({});
         setShowTemplates(false);
+        updateWindowStatus(recipientIdentity);
       } else {
         updateMessageStatus(messageId, 'failed');
         // Extract detailed error message

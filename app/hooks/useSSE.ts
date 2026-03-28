@@ -1,10 +1,15 @@
 import { useEffect, useRef, useCallback } from 'react';
+import type { ActiveChat } from '../components/types';
 
 export interface SSEMessage {
   type: 'connected' | 'new_message' | 'active_chats_updated' | 'message_status_update';
   message?: any;
   messageId?: string;
   status?: string;
+  businessNumberId?: string;
+  chat?: ActiveChat;
+  chatKey?: string;
+  refresh?: boolean;
 }
 
 export interface UseSSEOptions {
@@ -183,4 +188,3 @@ export function useSSE({
 
   return { connect, disconnect };
 }
-

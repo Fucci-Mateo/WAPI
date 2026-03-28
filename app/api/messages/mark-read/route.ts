@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../../lib/auth';
-import { MessageDatabaseService, BusinessNumberDatabaseService } from '../../../lib/database';
+import { MessageDatabaseService, BusinessNumberDatabaseService, conversationSummaryDB } from '../../../lib/database';
 import { prisma } from '../../../lib/database';
+import { getCanonicalContactIdentity, getContactIdentityAliases, normalizeWhatsAppIdentity } from '../../../lib/whatsappIdentity';
 
 const messageService = new MessageDatabaseService();
 const businessNumberService = new BusinessNumberDatabaseService();
@@ -62,26 +63,51 @@ export async function POST(req: NextRequest) {
 
     // Resolve the phone number ID
     const resolvedNumberId = await resolvePhoneNumberId(numberId);
+    const businessNumber = await businessNumberService.getByNumberId(resolvedNumberId);
+    const businessScope = businessNumber?.wabaId || null;
+    const businessAliases = Array.from(new Set([
+      normalizeWhatsAppIdentity(resolvedNumberId),
+      normalizeWhatsAppIdentity(businessNumber?.phoneNumber),
+    ].filter(Boolean)));
 
-    // Normalize phone number
-    const normalizePhoneNumber = (phone: string): string => {
-      if (!phone) return '';
-      let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-      normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-      return normalized;
-    };
+    const normalizedIdentity = normalizeWhatsAppIdentity(phoneNumber);
+    const contact = await (businessScope
+      ? prisma.contact.findFirst({
+          where: {
+            wabaId: businessScope,
+            OR: [
+              { phoneNumber: normalizedIdentity },
+              { businessScopedUserId: normalizedIdentity },
+              { whatsappId: normalizedIdentity },
+            ],
+          },
+        })
+      : prisma.contact.findFirst({
+          where: {
+            OR: [
+              { phoneNumber: normalizedIdentity },
+              { businessScopedUserId: normalizedIdentity },
+              { whatsappId: normalizedIdentity },
+            ],
+          },
+        }));
+    const aliases = contact ? getContactIdentityAliases(contact) : [normalizedIdentity];
+    const canonicalIdentity = contact ? getCanonicalContactIdentity(contact) : normalizedIdentity;
 
-    const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
-    console.log(`🔍 Marking messages as read for phone: ${phoneNumber} (normalized: ${normalizedPhoneNumber})`);
+    console.log(`🔍 Marking messages as read for identity: ${phoneNumber} (normalized: ${normalizedIdentity}, canonical: ${canonicalIdentity})`);
 
     // Find all unread received messages from this customer
     // For RECEIVED messages: from = customer phone, to = business phone
-    // First try exact match, then fall back to fetching all and filtering by normalized
     let unreadMessages = await prisma.message.findMany({
       where: {
         type: 'RECEIVED',
         status: { not: 'READ' },
-        from: normalizedPhoneNumber, // Try exact match first
+        OR: aliases.flatMap((alias) =>
+          businessAliases.map((businessAlias) => ({
+            from: alias,
+            to: businessAlias,
+          }))
+        ),
       },
       select: {
         id: true,
@@ -91,10 +117,8 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    // If no messages found with exact match, try fetching all and filtering by normalized
-    // This handles cases where phone numbers might be stored with different formats
     if (unreadMessages.length === 0) {
-      console.log(`⚠️ No messages found with exact match, trying normalized comparison...`);
+      console.log(`⚠️ No messages found with exact/alias match, trying normalized comparison...`);
       const allUnreadMessages = await prisma.message.findMany({
         where: {
           type: 'RECEIVED',
@@ -109,8 +133,12 @@ export async function POST(req: NextRequest) {
       });
 
       unreadMessages = allUnreadMessages.filter(msg => {
-        const msgFromNormalized = normalizePhoneNumber(msg.from);
-        return msgFromNormalized === normalizedPhoneNumber;
+        const msgFromNormalized = normalizeWhatsAppIdentity(msg.from);
+        const msgToNormalized = normalizeWhatsAppIdentity(msg.to);
+        return (
+          aliases.some((alias) => normalizeWhatsAppIdentity(alias) === msgFromNormalized) &&
+          businessAliases.some((businessAlias) => businessAlias === msgToNormalized)
+        );
       });
       console.log(`🔍 Found ${unreadMessages.length} messages after normalized comparison`);
     } else {
@@ -176,10 +204,25 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    const summary = await conversationSummaryDB.recalculateUnreadCount({
+      businessNumberId: resolvedNumberId,
+      customerIdentity: normalizedIdentity,
+      contact: contact
+        ? {
+            id: contact.id,
+            phoneNumber: contact.phoneNumber,
+            businessScopedUserId: contact.businessScopedUserId,
+            whatsappId: contact.whatsappId,
+            name: contact.name,
+          }
+        : null,
+      businessScope,
+    });
+
     // Broadcast active chats update to refresh unread counts
     try {
       const { broadcastActiveChatsUpdate } = await import('../../realtime/broadcast');
-      broadcastActiveChatsUpdate(resolvedNumberId);
+      broadcastActiveChatsUpdate(resolvedNumberId, summary || undefined);
     } catch (error) {
       console.error('Error broadcasting active chats update:', error);
     }
@@ -190,6 +233,7 @@ export async function POST(req: NextRequest) {
       marked: successCount,
       failed: failCount,
       results,
+      summary,
     });
   } catch (error) {
     console.error('❌ Error in mark-read API:', error);

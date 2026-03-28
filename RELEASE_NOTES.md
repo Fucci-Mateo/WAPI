@@ -1,5 +1,46 @@
 # Release Notes
 
+## Version 0.2.2 - March 28, 2026
+
+### Summary
+
+- Optimized large inboxes so active chat lists remain responsive at 3,500+ conversations.
+- Added a summary-backed read model and virtualized sidebar rendering for the inbox.
+- Fixed customer service window handling so outbound sends no longer extend the 24-hour timer and free-form sends are enforced server-side.
+- Kept `Message` as the source of truth and made the summary layer rebuildable.
+
+### Included Changes
+
+- Added `ConversationSummary` and supporting indexes.
+- Added admin backfill support at `/api/admin/conversation-summaries/backfill`.
+- Refactored `/api/contacts` to read summaries instead of scanning the full message history.
+- Updated send, template, webhook, and mark-read flows to keep summary rows and unread counts in sync.
+- Updated SSE and store behavior so one chat row can be patched without forcing a full sidebar reload.
+
+### Deployment Notes
+
+- This rollout includes Prisma migrations.
+- Run the normal deployment for the target environment, then run the summary backfill from an authenticated admin session.
+- See [CLIENT_DEPLOYMENT_RUNBOOK.md](./CLIENT_DEPLOYMENT_RUNBOOK.md) for the exact rollout checklist.
+
+### Breaking Changes
+
+- No external API contract changes.
+
+## Version 0.2.1 - March 25, 2026
+
+### 🔧 Improvements
+
+- Added GitHub Actions workflow for automated release publishing
+- Updated package version and changelog links for the main repository
+
+### 📝 Notes
+
+- No database migration required
+- This is a maintenance release for the main repository
+
+---
+
 ## Version 0.2.0 - January 29, 2026
 
 ### 🎉 Major Features

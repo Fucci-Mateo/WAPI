@@ -3,25 +3,17 @@ import { useCallback } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { useSSE, SSEMessage } from '../hooks/useSSE';
 import { Message } from './types';
+import { normalizeWhatsAppIdentity } from '../lib/whatsappIdentity';
 
 export default function SSEProvider() {
-  const {
-    selectedNumber,
-    activeChat,
-    addMessage,
-    replaceMessage,
-    updateMessageStatus,
-    setContactNames,
-    fetchActiveChats,
-  } = useAppStore();
-
-  // Helper to normalize phone numbers
-  const normalizePhoneNumber = (phone: string): string => {
-    if (!phone) return '';
-    let normalized = phone.startsWith('+') ? phone.substring(1) : phone;
-    normalized = normalized.replace(/\s+/g, '').replace(/%20/g, '');
-    return normalized;
-  };
+  const selectedNumber = useAppStore((state) => state.selectedNumber);
+  const activeChat = useAppStore((state) => state.activeChat);
+  const addMessage = useAppStore((state) => state.addMessage);
+  const replaceMessage = useAppStore((state) => state.replaceMessage);
+  const updateMessageStatus = useAppStore((state) => state.updateMessageStatus);
+  const setContactNames = useAppStore((state) => state.setContactNames);
+  const fetchActiveChats = useAppStore((state) => state.fetchActiveChats);
+  const upsertActiveChat = useAppStore((state) => state.upsertActiveChat);
 
   // Handle SSE messages - MEMOIZED to prevent reconnection loops
   const handleSSEMessage = useCallback((data: SSEMessage) => {
@@ -29,6 +21,9 @@ export default function SSEProvider() {
     const messages = useAppStore.getState().messages;
     if (data.type === 'new_message' && data.message) {
       const msg = data.message;
+      if (msg.businessNumberId && selectedNumber?.numberId && msg.businessNumberId !== selectedNumber.numberId) {
+        return;
+      }
       
       // Convert server message format to client format
       // Handle media messages format: [Type] media_id=xxx|fileName=xxx|mimeType=xxx|Caption text
@@ -81,6 +76,7 @@ export default function SSEProvider() {
         id: msg.id,
         from: msg.from,
         to: msg.to,
+        businessNumberId: msg.businessNumberId,
         text: displayText,
         timestamp: msg.timestamp,
         type: msg.type,
@@ -88,6 +84,8 @@ export default function SSEProvider() {
         userId: msg.userId,
         userName: msg.userName,
         media,
+        conversationKey: msg.conversationKey,
+        conversationAliases: msg.conversationAliases,
       };
 
       // Check if message already exists by ID (avoid duplicates)
@@ -130,12 +128,19 @@ export default function SSEProvider() {
           replaceMessage(optimisticMessage.id, clientMessage);
           
           // Update contact name if provided
-          if (msg.contactName && msg.from) {
-            const normalizedFrom = normalizePhoneNumber(msg.from);
-            setContactNames({
-              ...useAppStore.getState().contactNames,
-              [normalizedFrom]: msg.contactName,
-            });
+      if (msg.contactName && msg.from) {
+            const aliases = Array.from(new Set([
+              msg.conversationKey,
+              ...(msg.conversationAliases || []),
+              msg.from,
+              msg.to,
+            ].map((alias) => normalizeWhatsAppIdentity(alias)).filter(Boolean)));
+
+            const nextContactNames = { ...useAppStore.getState().contactNames };
+            for (const alias of aliases) {
+              nextContactNames[alias] = msg.contactName;
+            }
+            setContactNames(nextContactNames);
           }
           return;
         }
@@ -147,16 +152,28 @@ export default function SSEProvider() {
       
       // Update contact name if provided
       if (msg.contactName && msg.from) {
-        const normalizedFrom = normalizePhoneNumber(msg.from);
-        setContactNames({
-          ...useAppStore.getState().contactNames,
-          [normalizedFrom]: msg.contactName,
-        });
+        const aliases = Array.from(new Set([
+          msg.conversationKey,
+          ...(msg.conversationAliases || []),
+          msg.from,
+          msg.to,
+        ].map((alias) => normalizeWhatsAppIdentity(alias)).filter(Boolean)));
+
+        const nextContactNames = { ...useAppStore.getState().contactNames };
+        for (const alias of aliases) {
+          nextContactNames[alias] = msg.contactName;
+        }
+        setContactNames(nextContactNames);
       }
     } else if (data.type === 'active_chats_updated') {
       console.log('📋 Active chats updated, refreshing...');
-      // Refresh active chats list
-      if (selectedNumber?.numberId) {
+      if (data.businessNumberId && selectedNumber?.numberId && data.businessNumberId !== selectedNumber.numberId) {
+        return;
+      }
+
+      if (data.chat) {
+        upsertActiveChat(data.chat);
+      } else if (selectedNumber?.numberId && data.refresh !== false) {
         fetchActiveChats();
       }
     } else if (data.type === 'message_status_update' && (data as any).messageId && (data as any).status) {
@@ -164,7 +181,7 @@ export default function SSEProvider() {
       console.log('📊 Updating message status from SSE:', messageId, status);
       updateMessageStatus(messageId, status);
     }
-  }, [addMessage, replaceMessage, updateMessageStatus, setContactNames, fetchActiveChats, selectedNumber?.numberId]);
+  }, [addMessage, replaceMessage, updateMessageStatus, setContactNames, fetchActiveChats, selectedNumber?.numberId, upsertActiveChat]);
 
   const handleSSEError = useCallback((error: Event) => {
     console.error('SSE error:', error);
@@ -188,4 +205,3 @@ export default function SSEProvider() {
 
   return null; // This is a provider component, doesn't render anything
 }
-

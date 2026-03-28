@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/app/lib/auth';
-import { MessageDatabaseService, ContactDatabaseService, prisma } from '@/app/lib/database';
+import { MessageDatabaseService, prisma } from '@/app/lib/database';
+import type { ActiveChat } from '@/app/components/types';
 
 const messageService = new MessageDatabaseService();
-const contactService = new ContactDatabaseService();
 
 /**
  * Format template components into readable text
@@ -98,10 +98,9 @@ export async function GET(request: NextRequest) {
     console.log('📋 Fetching active contacts for business number:', businessNumberId);
 
     // Get active contacts with their latest message info
-    const contacts = await messageService.getActiveContacts(businessNumberId);
+    const contacts: ActiveChat[] = await messageService.getActiveContacts(businessNumberId);
 
-    // Hydrate template placeholders in lastMessage for users who are allowed to view
-    // Sidebar previews should show real template text when permitted.
+    // Hydrate template placeholders in lastMessage for users who are allowed to view.
     const templateNameSet = new Set<string>();
     for (const c of contacts) {
       const match = c.lastMessage?.match(/\[Template:\s*([^\]]+)\]/);
@@ -111,7 +110,7 @@ export async function GET(request: NextRequest) {
     }
 
     const templateNames = Array.from(templateNameSet);
-    const templatePreviewByName = new Map<string, string>();
+    const templateByName = new Map<string, { components: any[] }>();
 
     if (templateNames.length > 0) {
       const templates = await prisma.template.findMany({
@@ -128,7 +127,7 @@ export async function GET(request: NextRequest) {
       const normalizedRole = session.user.role?.toUpperCase()?.trim();
       const userId = session.user.id || null;
 
-      // Group templates by name and decide which (if any) the current user can view
+      // Group templates by name and decide which (if any) the current user can view.
       const byName = new Map<string, typeof templates>();
       for (const t of templates) {
         const arr = byName.get(t.name) || [];
@@ -147,64 +146,34 @@ export async function GET(request: NextRequest) {
         }
 
         if (chosen?.components) {
-          // Note: We don't have templateParameters here in the preview map,
-          // but individual contacts will have them in their lastMessage data
-          templatePreviewByName.set(name, formatTemplateContent(chosen.components as any));
+          templateByName.set(name, { components: chosen.components as any });
         }
       }
     }
 
-    // Get contact names from database
-    const contactNames: Record<string, string> = {};
-    for (const contact of contacts) {
-      try {
-        const contactInfo = await contactService.getContact(contact.phoneNumber);
-        if (contactInfo && contactInfo.name) {
-          contactNames[contact.phoneNumber] = contactInfo.name;
-        }
-      } catch (error) {
-        console.warn(`Could not fetch contact name for ${contact.phoneNumber}:`, error);
-      }
-    }
-
-    // Add contact names to the response and hydrate template content with actual parameters
-    const contactsWithNames = await Promise.all(contacts.map(async (contact) => {
+    // Add contact names to the response and hydrate template content with actual parameters.
+    const contactsWithNames = contacts.map((contact) => {
       let lastMessage = contact.lastMessage;
-      
+
       const match = contact.lastMessage?.match(/\[Template:\s*([^\]]+)\]/);
       const templateName = match?.[1]?.trim();
-      
+
       if (templateName) {
-        // Get the template preview (formatted template structure)
-        const templatePreview = templatePreviewByName.get(templateName);
-        
-        // If we have stored template parameters, fetch the full template and format with actual values
-        if (contact.templateParameters && templatePreview) {
-          const templates = await prisma.template.findMany({
-            where: { name: templateName },
-            select: { id: true, name: true, components: true },
-            take: 1,
-          });
-          
-          if (templates.length > 0 && templates[0].components) {
-            lastMessage = formatTemplateContent(
-              templates[0].components as any,
-              contact.templateParameters as Record<string, any>
-            );
-          } else {
-            lastMessage = templatePreview;
-          }
-        } else if (templatePreview) {
-          lastMessage = templatePreview;
+        const template = templateByName.get(templateName);
+        if (template?.components) {
+          lastMessage = formatTemplateContent(
+            template.components as any,
+            contact.templateParameters as Record<string, any> | undefined
+          );
         }
       }
-      
+
       return {
         ...contact,
         lastMessage,
-        contactName: contactNames[contact.phoneNumber] || null,
+        contactName: contact.contactName || null,
       };
-    }));
+    });
 
     return NextResponse.json({
       contacts: contactsWithNames,
@@ -218,4 +187,3 @@ export async function GET(request: NextRequest) {
     }, { status: 500 });
   }
 }
-

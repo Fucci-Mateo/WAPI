@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../lib/auth';
 import { MessageDatabaseService, ContactDatabaseService, BusinessNumberDatabaseService, templateDB, prisma } from '../../lib/database';
+import { getCanonicalContactIdentity, getContactIdentityAliases, normalizeWhatsAppIdentity } from '../../lib/whatsappIdentity';
 
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v19.0';
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -130,11 +131,21 @@ export async function GET(request: NextRequest) {
     const businessNumberId = searchParams.get('businessNumberId');
     const offset = parseInt(searchParams.get('offset') || '0', 10);
     const limit = parseInt(searchParams.get('limit') || '100', 10);
+    const businessNumber = businessNumberId ? await businessNumberService.getByNumberId(businessNumberId) : null;
+    const businessScope = businessNumber?.wabaId || null;
+    const requestedConversationKey = phoneNumber ? normalizeWhatsAppIdentity(phoneNumber) : null;
     
     let messages;
     let hasMore = false;
     
-    if (businessNumberId) {
+    if (phoneNumber && businessNumberId) {
+      messages = await messageService.getMessagesForConversation(businessNumberId, phoneNumber, limit + 1, offset);
+
+      hasMore = messages.length > limit;
+      if (hasMore) {
+        messages = messages.slice(0, limit);
+      }
+    } else if (businessNumberId) {
       console.log('📨 Messages API - business number filtering:', {
         businessNumberId,
         offset,
@@ -155,7 +166,7 @@ export async function GET(request: NextRequest) {
     } else if (phoneNumber) {
       // Filter by customer phone number (conversation with specific customer)
       // Fetch one more than requested to check if there are more messages
-      messages = await messageService.getMessagesByPhoneNumber(phoneNumber, limit + 1, offset);
+      messages = await messageService.getMessagesByPhoneNumber(phoneNumber, limit + 1, offset, businessScope);
       
       // Check if there are more messages
       hasMore = messages.length > limit;
@@ -178,26 +189,8 @@ export async function GET(request: NextRequest) {
       }
     }
     
-    // Get contact names for all unique phone numbers
+    // Resolve conversation identities and contact names for each message.
     const contactNames: Record<string, string> = {};
-    const uniqueNumbers = new Set<string>();
-    
-    messages.forEach((msg: any) => {
-      uniqueNumbers.add(msg.from);
-      uniqueNumbers.add(msg.to);
-    });
-    
-    // Fetch contact names from database
-    for (const number of uniqueNumbers) {
-      try {
-        const contact = await contactService.getContact(number);
-        if (contact && contact.name) {
-          contactNames[number] = contact.name;
-        }
-      } catch (error) {
-        console.warn(`Could not fetch contact for ${number}:`, error);
-      }
-    }
     
     // Get user names for all unique userIds (for sent messages)
     const uniqueUserIds = new Set<string>();
@@ -237,6 +230,30 @@ export async function GET(request: NextRequest) {
     // Add userName to messages that have userId and check template permissions
     const messagesWithUserInfo = await Promise.all(messages.map(async (msg: any) => {
       let messageWithInfo: any = { ...msg };
+      const customerIdentity = msg.type === 'SENT' ? msg.to : msg.from;
+      const contact = await contactService.getContact(customerIdentity, businessScope);
+      const canonicalConversationKey = contact ? getCanonicalContactIdentity(contact) : normalizeWhatsAppIdentity(customerIdentity);
+      const resolvedContactName = contact?.name || msg.contactName || null;
+      const responseConversationKey = requestedConversationKey || canonicalConversationKey;
+
+      messageWithInfo.conversationKey = responseConversationKey;
+      if (contact) {
+        const aliases = getContactIdentityAliases(contact);
+        messageWithInfo.conversationAliases = aliases;
+        if (resolvedContactName) {
+          for (const alias of aliases) {
+            contactNames[alias] = resolvedContactName;
+          }
+          contactNames[responseConversationKey] = resolvedContactName;
+          messageWithInfo.contactName = resolvedContactName;
+        }
+      } else if (resolvedContactName) {
+        messageWithInfo.conversationAliases = [responseConversationKey];
+        contactNames[responseConversationKey] = resolvedContactName;
+        messageWithInfo.contactName = resolvedContactName;
+      } else {
+        messageWithInfo.conversationAliases = [responseConversationKey];
+      }
       
       // Add user name if available
       if (msg.userId && userMap[msg.userId]) {

@@ -1,3 +1,6 @@
+import { normalizeWhatsAppIdentity } from '@/app/lib/whatsappIdentity';
+import type { ActiveChat } from '../../components/types';
+
 // Broadcast functions for SSE connections
 // Store active SSE connections
 // Using a global Map to persist across requests in Next.js
@@ -6,7 +9,7 @@ const connections = new Map<string, ReadableStreamDefaultController[]>();
 
 export function broadcastMessage(
   businessNumberId: string | null,
-  phoneNumber: string | null,
+  phoneNumber: string | string[] | null,
   message: any
 ) {
   const targets: string[] = [];
@@ -14,15 +17,27 @@ export function broadcastMessage(
   if (businessNumberId) {
     targets.push(`business:${businessNumberId}`);
   }
-  if (phoneNumber) {
-    targets.push(`phone:${phoneNumber}`);
+  const identityTargets = Array.isArray(phoneNumber)
+    ? phoneNumber
+    : phoneNumber
+      ? [phoneNumber]
+      : [];
+
+  for (const identity of identityTargets) {
+    const normalizedIdentity = normalizeWhatsAppIdentity(identity);
+    if (normalizedIdentity) {
+      targets.push(`phone:${normalizedIdentity}`);
+    }
   }
   if (targets.length === 0) {
     targets.push('default');
   }
 
   const encoder = new TextEncoder();
-  const data = `data: ${JSON.stringify({ type: 'new_message', message })}\n\n`;
+  const payloadMessage = businessNumberId
+    ? { ...message, businessNumberId }
+    : message;
+  const data = `data: ${JSON.stringify({ type: 'new_message', message: payloadMessage })}\n\n`;
 
   for (const target of targets) {
     const conns = connections.get(target);
@@ -49,13 +64,19 @@ export function broadcastMessage(
   }
 }
 
-export function broadcastActiveChatsUpdate(businessNumberId: string) {
+export function broadcastActiveChatsUpdate(businessNumberId: string, chat?: ActiveChat | null) {
   const target = `business:${businessNumberId}`;
   const conns = connections.get(target);
   if (!conns || conns.length === 0) return;
 
   const encoder = new TextEncoder();
-  const data = `data: ${JSON.stringify({ type: 'active_chats_updated' })}\n\n`;
+  const data = `data: ${JSON.stringify({
+    type: 'active_chats_updated',
+    businessNumberId,
+    chat: chat || undefined,
+    chatKey: chat?.chatKey || chat?.phoneNumber || undefined,
+    refresh: !chat,
+  })}\n\n`;
 
   const activeConns = conns.filter(controller => {
     try {
@@ -77,7 +98,7 @@ export function broadcastActiveChatsUpdate(businessNumberId: string) {
 
 export function broadcastMessageStatusUpdate(
   businessNumberId: string | null,
-  phoneNumber: string | null,
+  phoneNumber: string | string[] | null,
   messageId: string,
   status: string
 ) {
@@ -86,8 +107,17 @@ export function broadcastMessageStatusUpdate(
   if (businessNumberId) {
     targets.push(`business:${businessNumberId}`);
   }
-  if (phoneNumber) {
-    targets.push(`phone:${phoneNumber}`);
+  const identityTargets = Array.isArray(phoneNumber)
+    ? phoneNumber
+    : phoneNumber
+      ? [phoneNumber]
+      : [];
+
+  for (const identity of identityTargets) {
+    const normalizedIdentity = normalizeWhatsAppIdentity(identity);
+    if (normalizedIdentity) {
+      targets.push(`phone:${normalizedIdentity}`);
+    }
   }
   if (targets.length === 0) {
     targets.push('default');
@@ -123,4 +153,3 @@ export function broadcastMessageStatusUpdate(
 export function getConnections() {
   return connections;
 }
-
